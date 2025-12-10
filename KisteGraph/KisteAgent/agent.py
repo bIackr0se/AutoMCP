@@ -15,17 +15,40 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 
+# System prompts for tools
+# ====================
 class chat_mode(BaseModel):
-    """Switches to Chat Mode."""
-    request: str = Field(description="The user's command that triggered this mode.", default="switch")
-
-class standby_mode(BaseModel):
-    """Switches to Standby Mode."""
-    request: str = Field(description="The user's command that triggered this mode.", default="switch")
+    """
+    Use this tool for:
+    1. Analyzing, explaining, or interpreting the logs/data ALREADY retrieved in the conversation.
+    2. Answering general cybersecurity questions.
+    3. Greetings or small talk.
+    
+    DO NOT use this if the user specifically asks to perform a NEW search in the database.
+    """
+    request: str = Field(
+        description="The user's question or comment regarding the existing data or general topic.", 
+        default="Analyze this"
+    )
 
 class custom_query_mode(BaseModel):
-    """Switches to Custom Query Mode."""
-    request: str = Field(description="The user's command that triggered this mode.", default="switch")
+    """
+    Use this tool ONLY when the user asks to PERFORM A NEW SEARCH or QUERY in the database.
+    Triggers: 'Find alerts', 'Check this IP', 'Search for...', 'Show logs from...'
+    
+    DO NOT use this if the user is just asking about the logs currently visible in the chat.
+    """
+    request: str = Field(
+        description="The specific search criteria (e.g., 'Check IP 1.2.3.4').", 
+        default="Check latest alerts"
+    )
+
+class standby_mode(BaseModel):
+    """
+    Use this tool ONLY when the user explicitly asks to wait, watch, or monitor for NEW incoming alerts.
+    User may contain the word 'standby' in his request. This is a strong indicator to choose this tool.
+    """
+    request: str = Field(description="Ignored.", default="switch")
 
 tools = [chat_mode, standby_mode, custom_query_mode]
 # ====================
@@ -55,8 +78,6 @@ ES_PASSWORD = os.getenv("ES_PASSWORD")
 
 
 # ====================
-
-
 
 
 # Data Type Class
@@ -111,11 +132,14 @@ class QueryAlertParams(BaseModel):
 
 # ====================
 
+
 # State Class
 class AppState(MessagesState):
     pass
 
+
 # ====================
+
 
 # Initialize MCP Server
 mcp = FastMCP("mcp_server")
@@ -133,16 +157,8 @@ async def get_elastic_client(state: AppState):
 # ====================
 
 
-# Function for querying Elastic
-# Query function
-# Gerekli importlar (Eksikse ekleyin)
-# from elasticsearch import AsyncElasticsearch
-# from langchain_core.messages import AIMessage
-
 async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -> dict[str, Any] | None:
 
-    # 1. PARAMETRELERİ STATE'DEN ÇEKME (LLM'in ürettiği son mesajdan)
-    # Fonksiyon argümanı olarak değil, state'den almalıyız.
     last_message = state["messages"][-1]
     
     try:
@@ -152,11 +168,8 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         params = QueryAlertParams(**raw_params)
         
     except (json.JSONDecodeError, ValidationError):
-        # Eğer parametre parse edilemezse varsayılan boş parametre kullan veya hata dön
-        # Şimdilik hata durumunda boş obje ile devam edelim veya hata mesajı dönelim:
         return {"messages": [AIMessage(content="Error: Could not parse query parameters.")]}
 
-    # 2. SORGULAMA MANTIĞI (Sizin yazdığınız kod)
     DESIRED_OUTPUT_FIELDS = [
         "kibana.alert.rule.execution.timestamp",
         "kibana.alert.rule.parameters.severity",
@@ -174,7 +187,6 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         date_range = {}
         if params.start_date: date_range["gte"] = params.start_date
         if params.end_date: date_range["lte"] = params.end_date
-        # Alan adı genellikle @timestamp'tir ama sizin mapping'de bu ise böyle kalsın:
         filters.append({"range": {"kibana.alert.rule.execution.timestamp": date_range}})
     
     # Description
@@ -218,7 +230,7 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         query["size"] = 3
         query["_source"] = DESIRED_OUTPUT_FIELDS
 
-    print(f"ES QUERY on {index}: {json.dumps(query)}") # Debug için güzel
+    print(f"ES QUERY on {index}: {json.dumps(query)}")
 
     response = None
     
@@ -228,7 +240,6 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         except Exception as e:
             return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
 
-    # 4. SONUCU İŞLEME VE DÖNDÜRME
     processed_data = {}
 
     if params.aggregation:
@@ -359,36 +370,25 @@ async def generate_elastic_query(state: AppState):
     response_content = response.content
 
     try:
-        # 3. String'i Python Sözlüğüne (Dict) çevir
+
         params_dict = json.loads(response_content)
         
-        # 4. Pydantic ile Doğrula (Validation burada yapılıyor!)
-        # Hata aldığınız yer burasıydı, artık 'params_dict' bir sözlük olduğu için çalışacak.
         validated_obj = QueryAlertParams(**params_dict)
         
-        # 5. Doğrulanmış veriyi tekrar temiz bir JSON string'e çevir
-        # exclude_none=True ile boş alanları atıyoruz.
         final_json_str = json.dumps(validated_obj.model_dump(exclude_none=True))
         
-        # 6. Sonucu bir AIMessage olarak döndür
-        # Not: LangGraph akışında mesaj listesine obje değil, Message tipi eklemek en güvenlisidir.
         return {"messages": [AIMessage(content=final_json_str)]}
     
     except (json.JSONDecodeError, ValidationError) as e:
-        # JSON bozuksa veya Pydantic validasyonundan geçmezse hata mesajı döndür
         return {"messages": [AIMessage(content=f"Error parsing parameters: {str(e)}")]}
 
 
 def chat_mode(state: AppState):
-    """
-    Switches to Chat Mode. 
-    1. Closes the tool call with a ToolMessage (Must have tool_call_id).
-    2. Sends a welcome AIMessage.
-    """
     messages = []
     last_message = state["messages"][-1]
     
-    # Tool Call ID'sini bulup kapatıyoruz
+    initial_request = None
+
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "chat_mode":
@@ -398,10 +398,12 @@ def chat_mode(state: AppState):
                         content="Successfully switched to Chat Mode."
                     )
                 )
-    
-    # HATA ÇÖZÜMÜ: Buraya ID'siz ToolMessage yerine AIMessage koyuyoruz.
-    # Böylece zincir: AIMessage(Call) -> ToolMessage(Result) -> AIMessage(New Info) oluyor.
-    messages.append(AIMessage(content="Switched to Chat Mode. How can I help you?"))
+                initial_request = tool_call["args"].get("request")
+
+    messages.append(AIMessage(content="Switched to Chat Mode."))
+
+    if initial_request and initial_request != "switch":
+        messages.append(HumanMessage(content=initial_request))
     
     return {"messages": messages}
 
@@ -497,7 +499,6 @@ def standby_mode(state: AppState):
                     )
                 )
     
-    # Burası zaten AIMessage idi ama ToolMessage ile birlikte döndürmek daha sağlıklı
     messages.append(AIMessage(content="Welcome to Standby Mode. Waiting for security alerts..."))
     
     return {"messages": messages}
@@ -548,7 +549,8 @@ async def wait_alerts(state: AppState):
 def custom_query_mode(state: AppState):
     messages = []
     last_message = state["messages"][-1]
-    
+    initial_request = None
+
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "custom_query_mode":
@@ -558,8 +560,12 @@ def custom_query_mode(state: AppState):
                         content="Successfully switched to Custom Query Mode."
                     )
                 )
+                initial_request = tool_call["args"].get("request")
     
-    messages.append(AIMessage(content="Welcome to Custom Query Mode. Please specify your query parameters."))
+    messages.append(AIMessage(content="Switched to Custom Query Mode."))
+
+    if initial_request and initial_request != "switch":
+        messages.append(HumanMessage(content=initial_request))
     
     return {"messages": messages}
 
@@ -570,9 +576,15 @@ llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 sys_msg = SystemMessage(
     content=(
-        "You are a routing assistant. Your ONLY job is to route the user to the correct mode based on their input. "
-        "You MUST call one of the provided tools (chat_mode, standby_mode, custom_query_mode)."
-        "Do not reply with text. Just call the tool."
+        "You are an intelligent orchestration assistant. "
+        "Your task is to analyze the conversation history and route the user to the correct tool.\n\n"
+        
+        "DECISION LOGIC:\n"
+        "1. NEW DATA (custom_query_mode): Use this ONLY if the user asks to fetch, search, or find NEW data that is not currently visible (e.g., 'Check IP 1.1.1.1', 'Show me last 5 alerts').\n"
+        "2. ANALYSIS (chat_mode): Use this if the user asks about the DATA ALREADY RETRIEVED in the chat history (e.g., 'What does this mean?', 'Is this IP dangerous?', 'Explain the third log'). Also use this for general chat.\n"
+        "3. MONITORING (standby_mode): Use this only for explicit waiting/monitoring/standby requests.\n\n"
+        
+        "You MUST call one of the tools. Do not reply with text."
     )
 )
 
@@ -581,20 +593,14 @@ sys_msg = SystemMessage(
 
 def assistant(state: AppState):
 
-    # Interrupt ile input al
     prompt_text = interrupt("Main Menu - Your command:")
         
-    # HumanMessage oluştur
     new_message = HumanMessage(content=prompt_text)
         
-    # LLM'e gönderirken sys_msg + geçmiş + yeni mesaj
-    # Not: new_message'ı burada listeye koyuyoruz ama invoke'dan sonra 
-    # return ederken de state'e eklemeliyiz.
     all_messages = [sys_msg] + state["messages"] + [new_message]
         
     response = llm_with_tools.invoke(all_messages)
         
-    # State'e eklenecekler: Kullanıcının yeni mesajı VE LLM'in cevabı
     return {"messages": [new_message, response]}
 # ====================
 
@@ -621,25 +627,22 @@ builder.add_node("assistant", assistant)
 builder.add_node("chat_mode", chat_mode)
 builder.add_node("standby_mode", standby_mode)
 builder.add_node("custom_query_mode", custom_query_mode)
-
 builder.add_node("user_prompt_chat", user_prompt)
 builder.add_node("user_prompt_query", user_prompt)
-
 builder.add_node("call_llm", call_llm)
 builder.add_node("generate_elastic_query", generate_elastic_query)
 builder.add_node("execute_elastic_query_C", execute_elastic_query)
 builder.add_node("execute_elastic_query_S", execute_elastic_query)
-
 builder.add_node("query_analyzer_C", query_analyzer)
 builder.add_node("query_analyzer_S", query_analyzer)
-
 builder.add_node("wait_alerts", wait_alerts)
+
 
 builder.add_edge(START, "assistant")
 
 builder.add_conditional_edges(
-    "assistant",       # Kaynak node
-    route_mechanism,   # Karar verici fonksiyon (Router)
+    "assistant",
+    route_mechanism,
     {
         "chat_mode": "chat_mode",
         "standby_mode": "standby_mode",
@@ -648,30 +651,14 @@ builder.add_conditional_edges(
     }
 )
 
-builder.add_edge("chat_mode", "user_prompt_chat")
-builder.add_conditional_edges(
-    "user_prompt_chat",       
-    route_user_input_C,    
-    {
-        "assistant": "assistant",  # If 'assistant' returned, go here
-        "call_llm": "call_llm"     # If 'call_llm' returned, go there
-    }
-)
-builder.add_edge("call_llm", "chat_mode")
+builder.add_edge("chat_mode", "call_llm")
+builder.add_edge("call_llm", "assistant")
 
-builder.add_edge("custom_query_mode", "user_prompt_query")
+builder.add_edge("custom_query_mode", "generate_elastic_query")
 builder.add_edge("generate_elastic_query", "execute_elastic_query_C")
 builder.add_edge("execute_elastic_query_C", "query_analyzer_C")
-builder.add_edge("query_analyzer_C", "user_prompt_query")
+builder.add_edge("query_analyzer_C", "assistant")
 
-builder.add_conditional_edges(
-    "user_prompt_query",       
-    route_user_input_Q,    
-    {
-        "assistant": "assistant",  # If 'assistant' returned, go here
-        "generate_elastic_query": "generate_elastic_query"     # If 'call_llm' returned, go there
-    }
-)
 builder.add_edge("standby_mode", "wait_alerts")
 builder.add_edge("wait_alerts", "execute_elastic_query_S")
 builder.add_edge("execute_elastic_query_S", "query_analyzer_S")
