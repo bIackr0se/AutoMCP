@@ -2,6 +2,8 @@
 import json
 import asyncio
 import os, getpass
+import subprocess  # Added for recon tools
+import re          # Added for regex operations
 from typing import Any, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
@@ -15,8 +17,10 @@ from contextlib import asynccontextmanager
 from dotenv import load_dotenv
 from langchain_groq import ChatGroq
 
-# System prompts for tools
 # ====================
+# TOOL DEFINITIONS (PYDANTIC)
+# ====================
+
 class chat_mode(BaseModel):
     """
     Use this tool for:
@@ -46,24 +50,41 @@ class custom_query_mode(BaseModel):
 class standby_mode(BaseModel):
     """
     Use this tool ONLY when the user explicitly asks to wait, watch, or monitor for NEW incoming alerts.
-    User may contain the word 'standby' in his request. This is a strong indicator to choose this tool.
     """
     request: str = Field(description="Ignored.", default="switch")
 
-tools = [chat_mode, standby_mode, custom_query_mode]
+class analyze_attack_mode(BaseModel):
+    """
+    Use this tool when the user asks to ANALYZE a specific threat, attack, or alert structure based on MITRE ATT&CK or security expertise.
+    Triggers: 'Analyze this attack', 'Classify this threat', 'What stage of kill chain is this?'
+    """
+    request: str = Field(
+        description="The specific context or logs to analyze.", 
+        default="Analyze recent alerts"
+    )
+
+class counter_recon_mode(BaseModel):
+    """
+    Use this tool when the user asks to investigate an EXTERNAL IP address or Domain using tools like NMAP, WHOIS, DIG, CURL.
+    Triggers: 'Scan this IP', 'Who owns this domain?', 'Check DNS records for...', 'Investigate attacker infrastructure'
+    """
+    target: str = Field(
+        description="The specific IP address or Domain to scan. EXTRACT this from user input.", 
+        default="unknown"
+    )
+
+tools = [chat_mode, standby_mode, custom_query_mode, analyze_attack_mode, counter_recon_mode]
+
 # ====================
 
-
-# OpenAI API Key
+# OpenAI / Groq API Key Setup
 def _set_env(var: str):
     if not os.environ.get(var):
         os.environ[var] = getpass.getpass(f"{var}: ")
 
 _set_env("GROQ_API_KEY")
 
-
 # ====================
-
 
 # Elastic Constants
 load_dotenv()
@@ -76,11 +97,9 @@ LOCAL_TZINFO = timezone(timedelta(hours=LOCAL_TIMEZONE)) # For correcting local 
 ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
 
-
 # ====================
 
-
-# Data Type Class
+# Data Type Class for Elastic Query
 class QueryAlertParams(BaseModel):
 
     # Selected fields
@@ -129,17 +148,14 @@ class QueryAlertParams(BaseModel):
             raise ValueError(f"Invalid aggregation. Use one of: {valid_aggregations}")
         return value
 
-
 # ====================
-
 
 # State Class
 class AppState(MessagesState):
-    pass
-
+    # Optional dictionary to store structured attack analysis data
+    attack_analysis: Optional[dict] 
 
 # ====================
-
 
 # Initialize MCP Server
 mcp = FastMCP("mcp_server")
@@ -153,21 +169,20 @@ async def get_elastic_client(state: AppState):
     finally:
         await elastic_client.close()
 
-
 # ====================
-
 
 async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -> dict[str, Any] | None:
 
+    # 1. Retrieve parameters from State (from the last LLM message)
     last_message = state["messages"][-1]
     
     try:
         content = last_message.content
         raw_params = json.loads(content)
-
         params = QueryAlertParams(**raw_params)
         
     except (json.JSONDecodeError, ValidationError):
+        # Return error if parameters cannot be parsed
         return {"messages": [AIMessage(content="Error: Could not parse query parameters.")]}
 
     DESIRED_OUTPUT_FIELDS = [
@@ -195,7 +210,6 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
     
     # Severity
     if params.severity:
-        # Terms expects a list/array
         severity_val = params.severity if isinstance(params.severity, list) else [params.severity]
         filters.append({"terms": {"kibana.alert.rule.parameters.severity": severity_val}})
     
@@ -214,6 +228,7 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
             }
         })
 
+    # Aggregations logic
     if params.aggregation:
         interval_mapping = {"hourly": "1h", "daily": "1d", "weekly": "1w", "monthly": "1M"}
         es_interval = interval_mapping.get(params.aggregation, "1d")
@@ -240,6 +255,7 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         except Exception as e:
             return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
 
+    # Process and return results
     processed_data = {}
 
     if params.aggregation:
@@ -273,35 +289,14 @@ async def query_analyzer(state: AppState):
     sys_msg = f"""
     Important Rules to Follow:
         1. You are a data analyst assistant with a focus on cybersecurity. Make answers based ONLY on the following context.
-
-        2. The context contains several generated alert logs from 
-        cybersecurity rules and possibly got triggered by a suspicious activity.
- 
+        2. The context contains several generated alert logs from cybersecurity rules.
         3. Make comments about the results you got in a cybersecurity perspective.
-
-        4. If possible, make relevant correlations between different 
-        types of context you have. Because it might be a chained attack. 
-        Possible fields for founding correlations:
-            - MITRE ATT&CK information in each log to predict an attack chain.
-
-            - Timestamps are important to see how attacks evolve over 
-            time, and what the attacker is going to do after. They give you the 
-            timeline of the attack.
-
-            - You can check host and network information to see if the same attacker is targeting multiple hosts or services.
-            
-            - Rule name and rule description might give you clues about the attack type, but don't trust it fully.
-        
-        5. It is recommended to make comments about connected MITRE tactics, techniques, and subtechniques you found.
-
-        6. You can warn the user for upcoming steps with looking at 
-        previous steps. You can list future attack steps based on MITRE 
-        information in the log data.
-        
-        7. You can also give recommendations about how to proceed from now on about securing the environment.
+        4. Make relevant correlations (MITRE ATT&CK, Timestamps, Host info).
+        5. Warn the user for upcoming steps and recommend security measures.
     """
 
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    # Optimize token usage: only use recent context + query result
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
     response = await llm.ainvoke(sys_msg + f"\n{query_result}")
     
     response_content = response.content
@@ -310,8 +305,13 @@ async def query_analyzer(state: AppState):
 
 
 async def generate_elastic_query(state: AppState):
+    user_prompt = "Show me the latest security alerts from the last 24 hours"
 
-    user_prompt = state["messages"][-1].content
+    for msg in reversed(state["messages"]):
+        if isinstance(msg, HumanMessage):
+            user_prompt = msg.content
+            break
+
     data_schema_json = QueryAlertParams.model_json_schema()
     current_date = datetime.now().strftime("%Y-%m-%d")
 
@@ -359,29 +359,30 @@ async def generate_elastic_query(state: AppState):
         7. Respond ONLY with the JSON object.
     
     {correct_examples}
-
-    Now here is the real user question:\n
-    User Question: "{user_prompt}"
     """
 
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    response = await llm.ainvoke(sys_msg + f"\n{user_prompt}")
+    human_msg = HumanMessage(content=f"User Question: '{user_prompt}'")
+
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
     
+    response = await llm.ainvoke([sys_msg, human_msg])
     response_content = response.content
 
     try:
-
         params_dict = json.loads(response_content)
         
         validated_obj = QueryAlertParams(**params_dict)
-        
         final_json_str = json.dumps(validated_obj.model_dump(exclude_none=True))
         
         return {"messages": [AIMessage(content=final_json_str)]}
     
     except (json.JSONDecodeError, ValidationError) as e:
-        return {"messages": [AIMessage(content=f"Error parsing parameters: {str(e)}")]}
+        return {"messages": [AIMessage(content=f"Error parsing parameters: {str(e)} | Raw Output: {response_content}")]}
 
+
+# ====================
+# MODE HANDLERS
+# ====================
 
 def chat_mode(state: AppState):
     messages = []
@@ -389,6 +390,7 @@ def chat_mode(state: AppState):
     
     initial_request = None
 
+    # Handle Tool Call Logic
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "chat_mode":
@@ -402,148 +404,11 @@ def chat_mode(state: AppState):
 
     messages.append(AIMessage(content="Switched to Chat Mode."))
 
+    # Inject the user's intent into the conversation stream
     if initial_request and initial_request != "switch":
         messages.append(HumanMessage(content=initial_request))
     
     return {"messages": messages}
-
-
-# ====================
-
-
-def user_prompt(state: AppState):
-    """We get user input here."""
-
-    prompt = interrupt("Your prompt:")
-
-    return {"messages": [HumanMessage(content=prompt)]}
-
-
-# ====================
-
-
-def route_user_input_C(state: AppState):
-    last_message = state["messages"][-1]
-
-    # Check content
-    if isinstance(last_message, HumanMessage) and last_message.content.strip().lower() == "exit":
-        # Exit back to assistant
-        return "assistant"
-    
-    # Exit not requested, continue normal flow (to LLM)
-    return "call_llm"
-
-
-def route_user_input_Q(state: AppState):
-    last_message = state["messages"][-1]
-
-    # Check content
-    if isinstance(last_message, HumanMessage) and last_message.content.strip().lower() == "exit":
-        # Exit back to assistant
-        return "assistant"
-    
-    # Exit not requested, continue normal flow (to LLM)
-    return "generate_elastic_query"
-
-
-# ====================
-
-
-def call_llm(state: AppState):
-    """
-    We call the LLM and pass the system prompt and user prompt in it to get an answer.
-    """
-
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
-    
-    sys_msg = SystemMessage(
-        content = f"""
-            ROLE & OBJECTIVE
-                You are an expert Cybersecurity Data Analyst Assistant. You interpret database logs, detect anomalies, and answer user questions using the conversation history and tool outputs. You may also answer general cybersecurity questions.
-
-                INPUT STRUCTURE
-                The conversation may include:
-                1. User messages
-                2. Tool/system outputs (database logs, JSON, etc.)
-                3. Your previous answers
-
-                RULES
-                1. Data Priority: Base all analysis strictly on the logs provided. Do not invent IPs, timestamps, or events.
-                2. Missing Data: If a question cannot be answered from the current logs, reply:
-                "The current data does not contain information about that. Would you like to run a new query?"
-                3. General Knowledge: Use general cybersecurity knowledge only for conceptual explanations, never to infer specific events.
-                4. Tone: Be professional, concise, and alert-oriented.
-                5. Continuity: Treat the dialogue as continuous. References like "that IP" refer to the most recent relevant data.
-            """
-    )
-
-    response = llm.invoke([sys_msg] + state["messages"])
-
-    return {"messages": [response]}
-
-
-# ====================
-
-
-def standby_mode(state: AppState):
-    messages = []
-    last_message = state["messages"][-1]
-    
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
-            if tool_call["name"] == "standby_mode":
-                messages.append(
-                    ToolMessage(
-                        tool_call_id=tool_call["id"],
-                        content="Successfully switched to Standby Mode."
-                    )
-                )
-    
-    messages.append(AIMessage(content="Welcome to Standby Mode. Waiting for security alerts..."))
-    
-    return {"messages": messages}
-
-async def last_alert(state: AppState, alert_index: str= ES_ALERTS_INDEX):
-    """Returns the latest alert using the shared client configuration"""
-
-    latest_alert_query = {
-        "size": 1,
-        "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],
-        "_source": ["kibana.alert.rule.execution.timestamp", "kibana.alert.rule.name"]
-    }
-
-    try:
-        async with get_elastic_client(state) as client:
-
-            last_data = await client.search(index=alert_index, body=latest_alert_query)
-            last_hits = last_data.get('hits', {}).get('hits', [])
-
-            if not last_hits:
-                # print("No alerts found in the initial query.") 
-                return False
-            
-            last_alert = last_hits[0].get('_source', {})
-            return last_alert
-    
-    except Exception as e:
-        print(f"Error checking last alert: {e}")
-        return False
-
-async def wait_alerts(state: AppState):
-    """
-    Waits for security alerts in Standby Mode.
-    """    
-    while True:
-        last_alert_1 = await last_alert(state)
-        await asyncio.sleep(5)
-        last_alert_2 = await last_alert(state)
-
-        if last_alert_1 != last_alert_2:
-            return {"messages": [SystemMessage(content="new_alerts"), AIMessage(content= "{}")]}
-        else:
-            continue
-    # Fix!!!!
-# ====================
 
 
 def custom_query_mode(state: AppState):
@@ -570,9 +435,203 @@ def custom_query_mode(state: AppState):
     return {"messages": messages}
 
 
+def standby_mode(state: AppState):
+    messages = []
+    last_message = state["messages"][-1]
+    
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "standby_mode":
+                messages.append(
+                    ToolMessage(
+                        tool_call_id=tool_call["id"],
+                        content="Successfully switched to Standby Mode."
+                    )
+                )
+    
+    messages.append(AIMessage(content="Welcome to Standby Mode. Waiting for security alerts..."))
+    
+    return {"messages": messages}
+
+def analyze_attack(state: AppState):
+    """
+    Analyzes security alerts using a specialized persona.
+    """
+    messages = []
+    last_message = state["messages"][-1]
+
+    # Close Tool Call
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "analyze_attack_mode":
+                messages.append(ToolMessage(tool_call_id=tool_call["id"], content="Analyzing attack patterns..."))
+
+    # Token Optimization: Use only the last 10 messages
+    recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
+    
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    
+    analysis_prompt = SystemMessage(content="""You are a Senior Incident Response Analyst.
+    Analyze the available security alert data and provide:
+    
+    ## ATTACK CLASSIFICATION
+    - Attack type/technique (MITRE ATT&CK IDs)
+    - Severity assessment
+    
+    ## ATTACK WORKFLOW
+    - Kill chain stages involved
+    - Attacker objectives
+    
+    ## RECOMMENDATIONS
+    1. Immediate containment
+    2. Remediation
+    """)
+    
+    response = llm.invoke([analysis_prompt] + recent_messages)
+    
+    messages.append(response)
+    
+    # Store structured analysis in State
+    return {
+        "messages": messages,
+        "attack_analysis": {
+            "raw_analysis": response.content,
+            "timestamp": datetime.now().isoformat()
+        }
+    }
+
+def counter_recon(state: AppState):
+    """
+    Performs active reconnaissance (Nmap, Whois, Dig).
+    """
+    messages = []
+    target = None
+
+    # 1. Extract target from Tool Call
+    last_message = state["messages"][-1]
+    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+        for tool_call in last_message.tool_calls:
+            if tool_call["name"] == "counter_recon_mode":
+                messages.append(ToolMessage(tool_call_id=tool_call["id"], content="Starting active reconnaissance..."))
+                target = tool_call["args"].get("target")
+
+    # 2. Fallback: Find IP in recent messages using Regex
+    if not target or target == "unknown":
+        recent_text = " ".join([m.content for m in state["messages"][-5:] if isinstance(m, HumanMessage)])
+        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+        ips = re.findall(ip_pattern, recent_text)
+        if ips:
+            target = ips[0]
+        else:
+            return {"messages": messages + [AIMessage(content="I need a target IP or Domain to scan. Please specify one.")]}
+
+    # Helper function to run shell commands
+    def run_tool(cmd, timeout=30):
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            return result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
+        except Exception as e:
+            return f"Failed: {str(e)}"
+
+    # Perform scans
+    scan_results = f"## RECON REPORT FOR: {target}\n\n"
+    
+    # DIG
+    dig_res = run_tool(["dig", target, "+short"], timeout=5)
+    scan_results += f"### DNS (Dig)\n{dig_res}\n"
+    
+    # WHOIS (Truncated)
+    whois_res = run_tool(["whois", target], timeout=10)
+    scan_results += f"### WHOIS\n{whois_res[:500]}...\n"
+    
+    # Analyze results with LLM
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    analysis = llm.invoke([
+        SystemMessage(content="Analyze these reconnaissance results and identify risks."),
+        HumanMessage(content=scan_results)
+    ])
+
+    messages.append(AIMessage(content=f"{scan_results}\n\n### ANALYSIS\n{analysis.content}"))
+    return {"messages": messages}
+
+
 # ====================
 
-llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+def user_prompt(state: AppState):
+    """We get user input here."""
+    prompt = interrupt("Your prompt:")
+    return {"messages": [HumanMessage(content=prompt)]}
+
+# ====================
+
+def call_llm(state: AppState):
+    """
+    We call the LLM and pass the system prompt and user prompt in it to get an answer.
+    """
+    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    
+    sys_msg = SystemMessage(
+        content = f"""
+            ROLE & OBJECTIVE
+                You are an expert Cybersecurity Data Analyst Assistant. 
+
+                RULES
+                1. Data Priority: Base all analysis strictly on the logs provided.
+                2. Missing Data: Ask the user to run a query if data is missing.
+                3. Tone: Professional, concise, alert-oriented.
+            """
+    )
+    
+    # Optimization: Only send last 10 messages
+    recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
+    response = llm.invoke([sys_msg] + recent_messages)
+
+    return {"messages": [response]}
+
+# ====================
+
+async def last_alert(state: AppState, alert_index: str= ES_ALERTS_INDEX):
+    """Returns the latest alert using the shared client configuration"""
+
+    latest_alert_query = {
+        "size": 1,
+        "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],
+        "_source": ["kibana.alert.rule.execution.timestamp", "kibana.alert.rule.name"]
+    }
+
+    try:
+        async with get_elastic_client(state) as client:
+            last_data = await client.search(index=alert_index, body=latest_alert_query)
+            last_hits = last_data.get('hits', {}).get('hits', [])
+
+            if not last_hits:
+                return False
+            
+            last_alert = last_hits[0].get('_source', {})
+            return last_alert
+    
+    except Exception as e:
+        print(f"Error checking last alert: {e}")
+        return False
+
+async def wait_alerts(state: AppState):
+    """
+    Waits for security alerts in Standby Mode.
+    Loops indefinitely until a new alert is found.
+    """    
+    while True:
+        last_alert_1 = await last_alert(state)
+        await asyncio.sleep(5)
+        last_alert_2 = await last_alert(state)
+
+        if last_alert_1 != last_alert_2:
+            return {"messages": [SystemMessage(content="new_alerts"), AIMessage(content= "{}")]}
+        else:
+            continue
+
+# ====================
+
+llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 sys_msg = SystemMessage(
     content=(
@@ -580,9 +639,11 @@ sys_msg = SystemMessage(
         "Your task is to analyze the conversation history and route the user to the correct tool.\n\n"
         
         "DECISION LOGIC:\n"
-        "1. NEW DATA (custom_query_mode): Use this ONLY if the user asks to fetch, search, or find NEW data that is not currently visible (e.g., 'Check IP 1.1.1.1', 'Show me last 5 alerts').\n"
-        "2. ANALYSIS (chat_mode): Use this if the user asks about the DATA ALREADY RETRIEVED in the chat history (e.g., 'What does this mean?', 'Is this IP dangerous?', 'Explain the third log'). Also use this for general chat.\n"
-        "3. MONITORING (standby_mode): Use this only for explicit waiting/monitoring/standby requests.\n\n"
+        "1. NEW DATA (custom_query_mode): Fetch/Search NEW data from DB (e.g., 'Check IP 1.1.1.1', 'Show last 5 alerts').\n"
+        "2. ANALYSIS (chat_mode): Explain/Interpret ALREADY RETRIEVED data or general chat.\n"
+        "3. DEEP THREAT ANALYSIS (analyze_attack_mode): Structured MITRE ATT&CK analysis and Kill Chain assessment.\n"
+        "4. ACTIVE RECON (counter_recon_mode): Use active tools (Nmap/Whois/Dig) on an external Target IP/Domain.\n"
+        "5. MONITORING (standby_mode): Explicit waiting/monitoring/standby requests.\n\n"
         
         "You MUST call one of the tools. Do not reply with text."
     )
@@ -590,45 +651,45 @@ sys_msg = SystemMessage(
 
 # ====================
 
-
 def assistant(state: AppState):
 
     prompt_text = interrupt("Main Menu - Your command:")
-        
     new_message = HumanMessage(content=prompt_text)
-        
-    all_messages = [sys_msg] + state["messages"] + [new_message]
+    
+    # Optimization: Use sys_msg + last few messages + new message
+    recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
+    all_messages = [sys_msg] + recent_messages + [new_message]
         
     response = llm_with_tools.invoke(all_messages)
         
     return {"messages": [new_message, response]}
+
 # ====================
 
-
 def route_mechanism(state: AppState):
-
     last_message = state["messages"][-1]
     
-    # If there is a call
+    # If there is a tool call
     if hasattr(last_message, "tool_calls") and len(last_message.tool_calls) > 0:
-
         tool_name = last_message.tool_calls[0]["name"]
         return tool_name
 
     return END
 
-
 # ====================
-
+# GRAPH CONSTRUCTION
+# ====================
 
 builder = StateGraph(AppState)
 
+# Add Nodes
 builder.add_node("assistant", assistant)
 builder.add_node("chat_mode", chat_mode)
 builder.add_node("standby_mode", standby_mode)
 builder.add_node("custom_query_mode", custom_query_mode)
+builder.add_node("analyze_attack_mode", analyze_attack) # New Node
+builder.add_node("counter_recon_mode", counter_recon)   # New Node
 builder.add_node("user_prompt_chat", user_prompt)
-builder.add_node("user_prompt_query", user_prompt)
 builder.add_node("call_llm", call_llm)
 builder.add_node("generate_elastic_query", generate_elastic_query)
 builder.add_node("execute_elastic_query_C", execute_elastic_query)
@@ -637,9 +698,10 @@ builder.add_node("query_analyzer_C", query_analyzer)
 builder.add_node("query_analyzer_S", query_analyzer)
 builder.add_node("wait_alerts", wait_alerts)
 
-
+# Add Edges
 builder.add_edge(START, "assistant")
 
+# Router Logic
 builder.add_conditional_edges(
     "assistant",
     route_mechanism,
@@ -647,21 +709,30 @@ builder.add_conditional_edges(
         "chat_mode": "chat_mode",
         "standby_mode": "standby_mode",
         "custom_query_mode": "custom_query_mode",
+        "analyze_attack_mode": "analyze_attack_mode",
+        "counter_recon_mode": "counter_recon_mode",
         END : END
     }
 )
 
+# 1. Chat Flow (One-Shot: Return to Assistant)
 builder.add_edge("chat_mode", "call_llm")
 builder.add_edge("call_llm", "assistant")
 
+# 2. Query Flow (One-Shot: Return to Assistant)
 builder.add_edge("custom_query_mode", "generate_elastic_query")
 builder.add_edge("generate_elastic_query", "execute_elastic_query_C")
 builder.add_edge("execute_elastic_query_C", "query_analyzer_C")
 builder.add_edge("query_analyzer_C", "assistant")
 
+# 3. Standby Flow (Wait -> Alert -> Analyze -> Return to Assistant)
 builder.add_edge("standby_mode", "wait_alerts")
 builder.add_edge("wait_alerts", "execute_elastic_query_S")
 builder.add_edge("execute_elastic_query_S", "query_analyzer_S")
 builder.add_edge("query_analyzer_S", "assistant")
+
+# 4. New Tool Flows (One-Shot: Return to Assistant)
+builder.add_edge("analyze_attack_mode", "assistant")
+builder.add_edge("counter_recon_mode", "assistant")
 
 graph = builder.compile()
