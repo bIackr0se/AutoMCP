@@ -1,9 +1,10 @@
 # ===== Import libraries =====
 import json
 import asyncio
-import os, getpass
-import subprocess  # Added for recon tools
+import os
 import re          # Added for regex operations
+import whois         # pip install python-whois
+import dns.resolver  # pip install dnspython
 from typing import Any, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
@@ -14,8 +15,22 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 from mcp.server.fastmcp import FastMCP
 from elasticsearch import AsyncElasticsearch
 from contextlib import asynccontextmanager
-from dotenv import load_dotenv
 from langchain_groq import ChatGroq
+from pathlib import Path
+import asyncio
+import json
+import socket
+import re
+import shutil
+import ipaddress
+from urllib.parse import urlparse
+
+# Third-party libraries
+import requests
+import dns.resolver
+import whois
+import urllib3
+from langchain_core.messages import AIMessage, ToolMessage
 
 # ====================
 # TOOL DEFINITIONS (PYDANTIC)
@@ -53,15 +68,6 @@ class standby_mode(BaseModel):
     """
     request: str = Field(description="Ignored.", default="switch")
 
-class analyze_attack_mode(BaseModel):
-    """
-    Use this tool when the user asks to ANALYZE a specific threat, attack, or alert structure based on MITRE ATT&CK or security expertise.
-    Triggers: 'Analyze this attack', 'Classify this threat', 'What stage of kill chain is this?'
-    """
-    request: str = Field(
-        description="The specific context or logs to analyze.", 
-        default="Analyze recent alerts"
-    )
 
 class counter_recon_mode(BaseModel):
     """
@@ -73,21 +79,25 @@ class counter_recon_mode(BaseModel):
         default="unknown"
     )
 
-tools = [chat_mode, standby_mode, custom_query_mode, analyze_attack_mode, counter_recon_mode]
+tools = [chat_mode, standby_mode, custom_query_mode, counter_recon_mode]
 
 # ====================
 
 # OpenAI / Groq API Key Setup
 def _set_env(var: str):
     if not os.environ.get(var):
-        os.environ[var] = getpass.getpass(f"{var}: ")
+        # Use environment variable fallback instead of blocking getpass
+        # getpass.getpass() would block the event loop, so we skip it in async context
+        default_value = f"<{var}_not_set>"
+        os.environ[var] = default_value
+        print(f"Warning: {var} not found. Please set it as environment variable.")
 
-_set_env("GROQ_API_KEY")
+# Only try to set GROQ_API_KEY if it's not already set
+if not os.environ.get("GROQ_API_KEY"):
+    print("Warning: GROQ_API_KEY not found. Please set it as environment variable.")
 
 # ====================
-
-# Elastic Constants
-load_dotenv()
+# ES_HOST = "https://141.79.66.103:9200"
 ES_HOST = "http://localhost:9200"
 ES_ALERTS_INDEX = ".internal.alerts-security.alerts-default*" # Index for security alerts
 ES_INTEL_INDEX = "otx_pulses_minimal" # Index for threat intelligence
@@ -96,7 +106,6 @@ LOCAL_TIMEZONE = 1
 LOCAL_TZINFO = timezone(timedelta(hours=LOCAL_TIMEZONE)) # For correcting local time to UTC
 ES_USERNAME = os.getenv("ES_USERNAME")
 ES_PASSWORD = os.getenv("ES_PASSWORD")
-
 # ====================
 
 # Data Type Class for Elastic Query
@@ -163,7 +172,13 @@ mcp = FastMCP("mcp_server")
 # Initialize Elastic Client
 @asynccontextmanager
 async def get_elastic_client(state: AppState):
-    elastic_client = AsyncElasticsearch([ES_HOST], api_key=ES_API_KEY)
+    elastic_client = await asyncio.to_thread(
+        AsyncElasticsearch,
+        ES_HOST, 
+        basic_auth=(ES_USERNAME, ES_PASSWORD),
+        verify_certs=False
+    )
+    
     try:
         yield elastic_client
     finally:
@@ -173,7 +188,7 @@ async def get_elastic_client(state: AppState):
 
 async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -> dict[str, Any] | None:
 
-    # 1. Retrieve parameters from State (from the last LLM message)
+    # Retrieve parameters from State (from the last LLM message)
     last_message = state["messages"][-1]
     
     try:
@@ -296,7 +311,7 @@ async def query_analyzer(state: AppState):
     """
 
     # Optimize token usage: only use recent context + query result
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
     response = await llm.ainvoke(sys_msg + f"\n{query_result}")
     
     response_content = response.content
@@ -363,7 +378,7 @@ async def generate_elastic_query(state: AppState):
 
     human_msg = HumanMessage(content=f"User Question: '{user_prompt}'")
 
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
     
     response = await llm.ainvoke([sys_msg, human_msg])
     response_content = response.content
@@ -453,122 +468,303 @@ def standby_mode(state: AppState):
     
     return {"messages": messages}
 
-def analyze_attack(state: AppState):
-    """
-    Analyzes security alerts using a specialized persona.
-    """
-    messages = []
-    last_message = state["messages"][-1]
 
-    # Close Tool Call
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
-        for tool_call in last_message.tool_calls:
-            if tool_call["name"] == "analyze_attack_mode":
-                messages.append(ToolMessage(tool_call_id=tool_call["id"], content="Analyzing attack patterns..."))
+# Suppress SSL warnings for self-signed certificates (common in reconnaissance)
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-    # Token Optimization: Use only the last 10 messages
-    recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
+# --- HELPER FUNCTIONS ---
+
+def recursive_limit(data, limit=5):
+    """
+    Recursively limits the size of lists in a JSON object to prevent token overflow.
+    Adds a '... (x more)' string if truncated.
+    """
+    if isinstance(data, dict):
+        return {k: recursive_limit(v, limit) for k, v in data.items()}
+    elif isinstance(data, list):
+        trimmed = data[:limit]
+        processed = [recursive_limit(item, limit) for item in trimmed]
+        if len(data) > limit:
+            processed.append(f"... ({len(data) - limit} more items truncated)")
+        return processed
+    return data
+
+# --- ASYNC MODULES ---
+
+async def run_otx_scan(target, api_key):
+    """Fetches Threat Intelligence from AlienVault OTX (Smart Endpoint)."""
+    try:
+        ipaddress.ip_address(target)
+        endpoint_type = "IPv4"
+    except ValueError:
+        endpoint_type = "domain"
+
+    url = f"https://otx.alienvault.com/api/v1/indicators/{endpoint_type}/{target}/general"
+    headers = {'X-OTX-API-KEY': api_key}
     
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    try:
+        response = await asyncio.to_thread(requests.get, url, headers=headers, timeout=15)
+        
+        if response.status_code == 200:
+            full_data = response.json()
+            
+            target_keys = ["reputation", "asn", "country_name", "city", "pulse_info", "validation"]
+            filtered = {k: full_data.get(k) for k in target_keys}
+            return {"source": "AlienVault OTX", "data": recursive_limit(filtered, limit=5)}
+            
+        elif response.status_code == 404:
+             return {"source": "AlienVault OTX", "status": "No Intel Found (404) - Target is clean or unknown."}
+             
+        elif response.status_code == 400:
+             return {"source": "AlienVault OTX", "error": f"Bad Request (400). Endpoint: {endpoint_type}"}
+             
+        return {"source": "AlienVault OTX", "error": f"API Status Code {response.status_code}"}
+        
+    except Exception as e:
+        return {"source": "AlienVault OTX", "error": str(e)}
+
+async def run_dns_scan(target):
+    """Performs Smart DNS Lookup (PTR for IP, A/MX for Domain)."""
+    results = {"type": "UNKNOWN", "reverse_lookup": None, "records": {}}
     
-    analysis_prompt = SystemMessage(content="""You are a Senior Incident Response Analyst.
-    Analyze the available security alert data and provide:
-    
-    ## ATTACK CLASSIFICATION
-    - Attack type/technique (MITRE ATT&CK IDs)
-    - Severity assessment
-    
-    ## ATTACK WORKFLOW
-    - Kill chain stages involved
-    - Attacker objectives
-    
-    ## RECOMMENDATIONS
-    1. Immediate containment
-    2. Remediation
-    """)
-    
-    response = llm.invoke([analysis_prompt] + recent_messages)
-    
-    messages.append(response)
-    
-    # Store structured analysis in State
-    return {
-        "messages": messages,
-        "attack_analysis": {
-            "raw_analysis": response.content,
-            "timestamp": datetime.now().isoformat()
+    # 1. Identify Type
+    try:
+        ipaddress.ip_address(target)
+        is_ip = True
+        results["type"] = "IP"
+    except ValueError:
+        is_ip = False
+        results["type"] = "DOMAIN"
+
+    try:
+        if is_ip:
+            # Reverse DNS (PTR)
+            try:
+                hostname, _, _ = await asyncio.to_thread(socket.gethostbyaddr, target)
+                results["reverse_lookup"] = hostname
+            except socket.herror:
+                results["reverse_lookup"] = "NXDOMAIN (No PTR Record Found)"
+        else:
+            # Domain Records
+            resolver = dns.resolver.Resolver()
+            resolver.timeout = 4.0
+            resolver.lifetime = 4.0
+            
+            # A Record
+            try:
+                ans = await asyncio.to_thread(resolver.resolve, target, 'A')
+                results["records"]["A"] = [r.to_text() for r in ans]
+            except: results["records"]["A"] = []
+            
+            # MX Record
+            try:
+                ans = await asyncio.to_thread(resolver.resolve, target, 'MX')
+                results["records"]["MX"] = [f"{r.exchange.to_text()} (Pri: {r.preference})" for r in ans]
+            except: results["records"]["MX"] = []
+            
+    except Exception as e:
+        results["error"] = str(e)
+    return results
+
+async def run_whois_scan(target):
+    """Fetches Domain/IP Registration Info."""
+    try:
+        # Run synchronous whois in a thread
+        w = await asyncio.to_thread(whois.whois, target)
+        
+        # Normalize data (whois libs can return lists or strings)
+        org = w.org[0] if isinstance(w.org, list) else w.org
+        country = w.country[0] if isinstance(w.country, list) else w.country
+        
+        return {
+            "organization": org if org else "Unknown/Redacted",
+            "country": country,
+            "creation_date": str(w.creation_date[0]) if isinstance(w.creation_date, list) else str(w.creation_date),
+            "registrar": w.registrar[0] if isinstance(w.registrar, list) else w.registrar
         }
+    except Exception as e:
+        # Common to fail on IPs or specific TLDs
+        return {"status": "WHOIS Lookup Failed or Timed Out", "details": str(e)}
+
+async def run_nmap_scan(target):
+    """Performs Active Port Scanning via Subprocess."""
+    nmap_path = await asyncio.to_thread(shutil.which, "nmap")
+    if not nmap_path:
+        return {"error": "Nmap tool not found in system PATH. Active scan skipped."}
+    
+    try:
+        # Flags: -Pn (No ping), --top-ports 50 (Speed), -T4 (Aggressive timing), --open (Only open ports)
+        cmd = ["nmap", "-Pn", "--top-ports", "50", "-T4", "--open", target]
+        
+        process = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        
+        # Timeout after 45 seconds to prevent hanging the agent
+        try:
+            stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=45)
+            
+            if process.returncode == 0:
+                raw = stdout.decode().strip()
+                # Parse output for cleaner JSON
+                open_ports = []
+                for line in raw.split('\n'):
+                    if "/tcp" in line and "open" in line:
+                        parts = line.split()
+                        open_ports.append(f"{parts[0]} ({parts[2]})") # e.g. "80/tcp (http)"
+                
+                return {
+                    "tool": "Nmap", 
+                    "status": "Completed", 
+                    "open_ports": open_ports if open_ports else "None found (Filtered/Closed)",
+                    "raw_summary": raw[:600] # Limit char count
+                }
+            else:
+                return {"error": "Nmap process failed", "details": stderr.decode()}
+                
+        except asyncio.TimeoutError:
+            try: process.kill() 
+            except: pass
+            return {"error": "Scan Timed Out (>45s)"}
+            
+    except Exception as e:
+        return {"error": str(e)}
+
+async def run_http_scan(target):
+    """Fingerprints Web Server Headers with Browser Masquerading."""
+    results = {"status": "Unreachable", "headers": {}}
+    
+    url = target if target.startswith("http") else f"https://{target}"
+    
+    fake_headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     }
 
-def counter_recon(state: AppState):
+    try:
+        resp = await asyncio.to_thread(requests.head, url, headers=fake_headers, verify=False, timeout=10)
+        results["status"] = resp.status_code
+        results["url"] = url
+        
+        interesting = ["Server", "X-Powered-By", "Content-Type", "Set-Cookie"]
+        for k, v in resp.headers.items():
+            if k in interesting:
+                results["headers"][k] = v
+                
+    except requests.exceptions.SSLError:
+        if url.startswith("https"):
+            try:
+                http_url = url.replace("https", "http")
+                resp = await asyncio.to_thread(requests.head, http_url, headers=fake_headers, timeout=10)
+                results["status"] = resp.status_code
+                results["url"] = http_url
+                results["headers"]["Server"] = resp.headers.get("Server", "Unknown")
+            except: pass
+    except Exception as e:
+        results["error_detail"] = str(e)
+        pass 
+        
+    return results
+
+# --- MAIN AGENT TOOL ---
+
+async def counter_recon(state: AppState):
     """
-    Performs active reconnaissance (Nmap, Whois, Dig).
+    Orchestrates the active/passive reconnaissance flow.
+    Runs parallel scanners -> Calls LLM internally -> Returns JSON + Analysis.
     """
     messages = []
     target = None
-
-    # 1. Extract target from Tool Call
+    
     last_message = state["messages"][-1]
-    if isinstance(last_message, AIMessage) and last_message.tool_calls:
+    if hasattr(last_message, "tool_calls") and last_message.tool_calls:
         for tool_call in last_message.tool_calls:
             if tool_call["name"] == "counter_recon_mode":
-                messages.append(ToolMessage(tool_call_id=tool_call["id"], content="Starting active reconnaissance..."))
                 target = tool_call["args"].get("target")
-
-    # 2. Fallback: Find IP in recent messages using Regex
-    if not target or target == "unknown":
-        recent_text = " ".join([m.content for m in state["messages"][-5:] if isinstance(m, HumanMessage)])
-        ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
-        ips = re.findall(ip_pattern, recent_text)
-        if ips:
-            target = ips[0]
-        else:
-            return {"messages": messages + [AIMessage(content="I need a target IP or Domain to scan. Please specify one.")]}
-
-    # Helper function to run shell commands
-    def run_tool(cmd, timeout=30):
-        try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-            return result.stdout if result.returncode == 0 else f"Error: {result.stderr}"
-        except Exception as e:
-            return f"Failed: {str(e)}"
-
-    # Perform scans
-    scan_results = f"## RECON REPORT FOR: {target}\n\n"
+                messages.append(ToolMessage(tool_call_id=tool_call["id"], content=f"Scanning target: {target}..."))
+                break
     
-    # DIG
-    dig_res = run_tool(["dig", target, "+short"], timeout=5)
-    scan_results += f"### DNS (Dig)\n{dig_res}\n"
+    if not target:
+        recent_text = " ".join([m.content for m in state["messages"][-3:] if hasattr(m, "content")])
+        ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', recent_text)
+        target = ips[0] if ips else "Unknown"
+
+    if target == "Unknown":
+         return {"messages": messages + [AIMessage(content="❌ Hedef IP veya Domain bulunamadı.")]}
+
+    print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target}")
+
+    API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
     
-    # WHOIS (Truncated)
-    whois_res = run_tool(["whois", target], timeout=10)
-    scan_results += f"### WHOIS\n{whois_res[:500]}...\n"
+    results = await asyncio.gather(
+        run_otx_scan(target, API_KEY),
+        run_dns_scan(target),
+        run_whois_scan(target),
+        run_nmap_scan(target),
+        run_http_scan(target)
+    )
+
+    recon_report = {
+        "target": target,
+        "threat_intel": results[0],
+        "dns": results[1],
+        "whois": results[2],
+        "nmap": results[3],
+        "http": results[4]
+    }
+
+    json_output = json.dumps(recon_report, indent=2)
+
+    print("[AGENT] 🧠 Analyzing data with internal LLM...")
     
-    # Analyze results with LLM
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-    analysis = llm.invoke([
-        SystemMessage(content="Analyze these reconnaissance results and identify risks."),
-        HumanMessage(content=scan_results)
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    
+    system_prompt = """You are a Tier-3 SOC Analyst. 
+    Analyze the provided Reconnaissance Data JSON.
+    
+    Output Format:
+    1. 🛡️ **Verdict**: Safe / Suspicious / Malicious
+    2. 🔍 **Key Findings**: (Open ports, OTX pulses, unexpected headers, missing DNS)
+    3. 💡 **Correlation**: How do these findings relate?
+    4. 🚀 **Action**: Block IP / Investigate Further / Ignore
+    """
+    
+    user_content = f"TARGET: {target}\n\nDATA:\n```json\n{json_output}\n```"
+    
+    analysis_response = await llm.ainvoke([
+        SystemMessage(content=system_prompt),
+        HumanMessage(content=user_content)
     ])
 
-    messages.append(AIMessage(content=f"{scan_results}\n\n### ANALYSIS\n{analysis.content}"))
+    final_output = (
+        f"### 📡 RECONNAISSANCE DATA (RAW)\n"
+        f"```json\n{json_output}\n```\n\n"
+        f"---\n\n"
+        f"### 🧠 INTELLIGENCE ANALYSIS\n"
+        f"{analysis_response.content}"
+    )
+    
+    messages.append(AIMessage(content=final_output))
+    
+    print("[AGENT] ✅ Analysis Complete. Returning full report.")
+    
     return {"messages": messages}
 
+# ====================
+
+# Function to get user prompt if needed.
+# def user_prompt(state: AppState):
+#     """We get user input here."""
+#     prompt = interrupt("Your prompt:")
+#     return {"messages": [HumanMessage(content=prompt)]}
 
 # ====================
 
-def user_prompt(state: AppState):
-    """We get user input here."""
-    prompt = interrupt("Your prompt:")
-    return {"messages": [HumanMessage(content=prompt)]}
-
-# ====================
-
-def call_llm(state: AppState):
+async def call_llm(state: AppState):
     """
     We call the LLM and pass the system prompt and user prompt in it to get an answer.
     """
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
     
     sys_msg = SystemMessage(
         content = f"""
@@ -582,9 +778,9 @@ def call_llm(state: AppState):
             """
     )
     
-    # Optimization: Only send last 10 messages
+    # Only send last 10 messages
     recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
-    response = llm.invoke([sys_msg] + recent_messages)
+    response = await llm.ainvoke([sys_msg] + recent_messages)
 
     return {"messages": [response]}
 
@@ -629,9 +825,9 @@ async def wait_alerts(state: AppState):
         else:
             continue
 
-# ====================
 
-llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
+# ====================
+llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 sys_msg = SystemMessage(
     content=(
@@ -641,9 +837,8 @@ sys_msg = SystemMessage(
         "DECISION LOGIC:\n"
         "1. NEW DATA (custom_query_mode): Fetch/Search NEW data from DB (e.g., 'Check IP 1.1.1.1', 'Show last 5 alerts').\n"
         "2. ANALYSIS (chat_mode): Explain/Interpret ALREADY RETRIEVED data or general chat.\n"
-        "3. DEEP THREAT ANALYSIS (analyze_attack_mode): Structured MITRE ATT&CK analysis and Kill Chain assessment.\n"
-        "4. ACTIVE RECON (counter_recon_mode): Use active tools (Nmap/Whois/Dig) on an external Target IP/Domain.\n"
-        "5. MONITORING (standby_mode): Explicit waiting/monitoring/standby requests.\n\n"
+        "3. ACTIVE RECON (counter_recon_mode): Use active tools (Nmap/Whois/Dig) on an external Target IP/Domain.\n"
+        "4. MONITORING (standby_mode): Explicit waiting/monitoring/standby requests.\n\n"
         
         "You MUST call one of the tools. Do not reply with text."
     )
@@ -651,7 +846,7 @@ sys_msg = SystemMessage(
 
 # ====================
 
-def assistant(state: AppState):
+async def assistant(state: AppState):
 
     prompt_text = interrupt("Main Menu - Your command:")
     new_message = HumanMessage(content=prompt_text)
@@ -660,7 +855,7 @@ def assistant(state: AppState):
     recent_messages = state["messages"][-10:] if len(state["messages"]) > 10 else state["messages"]
     all_messages = [sys_msg] + recent_messages + [new_message]
         
-    response = llm_with_tools.invoke(all_messages)
+    response = await llm_with_tools.ainvoke(all_messages)
         
     return {"messages": [new_message, response]}
 
@@ -687,9 +882,7 @@ builder.add_node("assistant", assistant)
 builder.add_node("chat_mode", chat_mode)
 builder.add_node("standby_mode", standby_mode)
 builder.add_node("custom_query_mode", custom_query_mode)
-builder.add_node("analyze_attack_mode", analyze_attack) # New Node
-builder.add_node("counter_recon_mode", counter_recon)   # New Node
-builder.add_node("user_prompt_chat", user_prompt)
+builder.add_node("counter_recon_mode", counter_recon)
 builder.add_node("call_llm", call_llm)
 builder.add_node("generate_elastic_query", generate_elastic_query)
 builder.add_node("execute_elastic_query_C", execute_elastic_query)
@@ -709,7 +902,6 @@ builder.add_conditional_edges(
         "chat_mode": "chat_mode",
         "standby_mode": "standby_mode",
         "custom_query_mode": "custom_query_mode",
-        "analyze_attack_mode": "analyze_attack_mode",
         "counter_recon_mode": "counter_recon_mode",
         END : END
     }
@@ -732,7 +924,6 @@ builder.add_edge("execute_elastic_query_S", "query_analyzer_S")
 builder.add_edge("query_analyzer_S", "assistant")
 
 # 4. New Tool Flows (One-Shot: Return to Assistant)
-builder.add_edge("analyze_attack_mode", "assistant")
 builder.add_edge("counter_recon_mode", "assistant")
 
 graph = builder.compile()
