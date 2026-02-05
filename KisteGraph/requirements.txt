@@ -6,6 +6,7 @@ langsmith
 langchain-community
 langchain-core
 langchain-openai
+langchain-groq
 notebook
 langchain-tavily
 wikipedia
