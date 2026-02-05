@@ -15,22 +15,14 @@ from pydantic import BaseModel, Field, field_validator, ValidationError
 from mcp.server.fastmcp import FastMCP
 from elasticsearch import AsyncElasticsearch
 from contextlib import asynccontextmanager
-from langchain_groq import ChatGroq
+from langchain_ollama import ChatOllama
 from pathlib import Path
-import asyncio
-import json
 import socket
-import re
 import shutil
 import ipaddress
 from urllib.parse import urlparse
-
-# Third-party libraries
 import requests
-import dns.resolver
-import whois
 import urllib3
-from langchain_core.messages import AIMessage, ToolMessage
 
 # ====================
 # TOOL DEFINITIONS (PYDANTIC)
@@ -97,8 +89,8 @@ if not os.environ.get("GROQ_API_KEY"):
     print("Warning: GROQ_API_KEY not found. Please set it as environment variable.")
 
 # ====================
-# ES_HOST = "https://141.79.66.103:9200"
-ES_HOST = "http://localhost:9200"
+ES_HOST = "https://141.79.66.103:9200"
+# ES_HOST = "http://localhost:9200"
 ES_ALERTS_INDEX = ".internal.alerts-security.alerts-default*" # Index for security alerts
 ES_INTEL_INDEX = "otx_pulses_minimal" # Index for threat intelligence
 ES_API_KEY = os.getenv("ES_API_KEY") # Elasticsearch API Key from environment variable
@@ -311,7 +303,7 @@ async def query_analyzer(state: AppState):
     """
 
     # Optimize token usage: only use recent context + query result
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
     response = await llm.ainvoke(sys_msg + f"\n{query_result}")
     
     response_content = response.content
@@ -378,7 +370,7 @@ async def generate_elastic_query(state: AppState):
 
     human_msg = HumanMessage(content=f"User Question: '{user_prompt}'")
 
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
     
     response = await llm.ainvoke([sys_msg, human_msg])
     response_content = response.content
@@ -717,7 +709,7 @@ async def counter_recon(state: AppState):
 
     print("[AGENT] 🧠 Analyzing data with internal LLM...")
     
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
     
     system_prompt = """You are a Tier-3 SOC Analyst. 
     Analyze the provided Reconnaissance Data JSON.
@@ -764,7 +756,7 @@ async def call_llm(state: AppState):
     """
     We call the LLM and pass the system prompt and user prompt in it to get an answer.
     """
-    llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
     
     sys_msg = SystemMessage(
         content = f"""
@@ -827,7 +819,7 @@ async def wait_alerts(state: AppState):
 
 
 # ====================
-llm = ChatGroq(model="llama-3.1-8b-instant", temperature=0)
+llm = ChatOllama(model="qwen2.5:3b", temperature=0)
 llm_with_tools = llm.bind_tools(tools)
 sys_msg = SystemMessage(
     content=(
