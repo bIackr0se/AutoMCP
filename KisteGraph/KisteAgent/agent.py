@@ -16,6 +16,7 @@ from mcp.server.fastmcp import FastMCP
 from elasticsearch import AsyncElasticsearch
 from contextlib import asynccontextmanager
 from langchain_ollama import ChatOllama
+from langchain_groq import ChatGroq
 from pathlib import Path
 import socket
 import shutil
@@ -23,6 +24,88 @@ import ipaddress
 from urllib.parse import urlparse
 import requests
 import urllib3
+
+# ====================
+# LLM BACKEND CONFIGURATION
+# ====================
+
+# Default settings
+DEFAULT_MODEL = "qwen2.5:3b"
+DEFAULT_BACKEND = "ollama"
+
+# Cache for the selected backend (set once at startup)
+_selected_backend: Optional[str] = None
+
+def get_llm_backend() -> str:
+    """
+    Get the selected LLM backend. Prompts user for selection on first call.
+    Returns 'ollama' (default) or 'groq'.
+    """
+    global _selected_backend
+    
+    if _selected_backend is not None:
+        return _selected_backend
+    
+    # Check for environment variable override
+    env_backend = os.environ.get("LLM_BACKEND", "").lower()
+    if env_backend in ["ollama", "groq"]:
+        _selected_backend = env_backend
+        print(f"[LLM] Using backend from environment: {_selected_backend}")
+        return _selected_backend
+    
+    # Prompt user for selection
+    print("\n" + "=" * 50)
+    print("🤖 LLM Backend Selection")
+    print("=" * 50)
+    print(f"Default model: {DEFAULT_MODEL}")
+    print("\nAvailable backends:")
+    print("  1. ollama (default) - Local LLM via Ollama")
+    print("  2. groq - Cloud LLM via Groq API")
+    print("\nPress Enter for default (ollama), or type 'groq':")
+    
+    try:
+        choice = input(">>> ").strip().lower()
+    except EOFError:
+        # Non-interactive mode, use default
+        choice = ""
+    
+    if choice == "groq" or choice == "2":
+        _selected_backend = "groq"
+        # Verify GROQ_API_KEY is set
+        if not os.environ.get("GROQ_API_KEY"):
+            print("⚠️  Warning: GROQ_API_KEY not found. API calls will fail. Please set it as environment variable.")
+    else:
+        _selected_backend = "ollama"
+    
+    print(f"[LLM] Selected backend: {_selected_backend}")
+    print("=" * 50 + "\n")
+    
+    return _selected_backend
+
+def get_llm(temperature: float = 0, model: Optional[str] = None):
+    """
+    Factory function to create the appropriate LLM instance based on user selection.
+    Supports ollama (default) or groq as an alternative backend.
+    
+    Args:
+        temperature: Temperature setting for the LLM (default: 0)
+        model: Model name (default: qwen2.5:3b for both backends)
+    
+    Returns:
+        ChatOllama or ChatGroq instance
+    
+    Raises:
+        ValueError: If groq backend is selected but GROQ_API_KEY is not set
+    """
+    backend = get_llm_backend()
+    model_name = model or DEFAULT_MODEL
+    
+    if backend == "groq":
+        if not os.environ.get("GROQ_API_KEY"):
+            raise ValueError("GROQ_API_KEY environment variable is required when using groq backend")
+        return ChatGroq(model=model_name, temperature=temperature)
+    else:
+        return ChatOllama(model=model_name, temperature=temperature)
 
 # ====================
 # TOOL DEFINITIONS (PYDANTIC)
@@ -303,7 +386,7 @@ async def query_analyzer(state: AppState):
     """
 
     # Optimize token usage: only use recent context + query result
-    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
+    llm = get_llm()
     response = await llm.ainvoke(sys_msg + f"\n{query_result}")
     
     response_content = response.content
@@ -370,7 +453,7 @@ async def generate_elastic_query(state: AppState):
 
     human_msg = HumanMessage(content=f"User Question: '{user_prompt}'")
 
-    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
+    llm = get_llm()
     
     response = await llm.ainvoke([sys_msg, human_msg])
     response_content = response.content
@@ -709,7 +792,7 @@ async def counter_recon(state: AppState):
 
     print("[AGENT] 🧠 Analyzing data with internal LLM...")
     
-    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
+    llm = get_llm()
     
     system_prompt = """You are a Tier-3 SOC Analyst. 
     Analyze the provided Reconnaissance Data JSON.
@@ -756,7 +839,7 @@ async def call_llm(state: AppState):
     """
     We call the LLM and pass the system prompt and user prompt in it to get an answer.
     """
-    llm = ChatOllama(model="qwen2.5:3b", temperature=0)
+    llm = get_llm()
     
     sys_msg = SystemMessage(
         content = f"""
@@ -819,7 +902,7 @@ async def wait_alerts(state: AppState):
 
 
 # ====================
-llm = ChatOllama(model="qwen2.5:3b", temperature=0)
+llm = get_llm()
 llm_with_tools = llm.bind_tools(tools)
 sys_msg = SystemMessage(
     content=(
