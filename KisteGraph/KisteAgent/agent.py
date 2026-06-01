@@ -371,8 +371,14 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         # falls back to recency-only (the original behaviour).
         if not params.aggregation:
             try:
+                # Inherit the main query's context filters but drop any severity
+                # clause, so the high-severity reserve is not ANDed into an
+                # impossible query when the user filtered on a non-high severity.
+                context_filters = [f for f in filters if not (
+                    isinstance(f, dict) and "kibana.alert.rule.parameters.severity" in f.get("terms", {})
+                )]
                 reserve_query = {
-                    "query": {"bool": {"must": filters + [
+                    "query": {"bool": {"must": context_filters + [
                         {"terms": {"kibana.alert.rule.parameters.severity": _HIGH_SEVERITIES}}
                     ]}},
                     "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],
