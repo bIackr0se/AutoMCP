@@ -365,12 +365,14 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
             return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
         # MITIGATION M2 (Sec 5.2): one bounded reserve query for high-severity
         # alerts, merged below so a critical alert is not displaced by benign
-        # volume. Safe fallback: on error or empty reserve, retention falls back
-        # to recency-only (the original behaviour), so this cannot break retrieval.
+        # volume. It inherits the main query's context filters (host, rule, date)
+        # so the reserve stays scoped to the user's request, then adds the
+        # severity constraint. Safe fallback: on error or empty reserve, retention
+        # falls back to recency-only (the original behaviour).
         if not params.aggregation:
             try:
                 reserve_query = {
-                    "query": {"bool": {"must": [
+                    "query": {"bool": {"must": filters + [
                         {"terms": {"kibana.alert.rule.parameters.severity": _HIGH_SEVERITIES}}
                     ]}},
                     "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],

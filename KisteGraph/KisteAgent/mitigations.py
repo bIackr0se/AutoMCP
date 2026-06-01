@@ -62,7 +62,7 @@ def validate_scan_target(target, originating_indicator):
     outside the deny-list (private / loopback / link-local / cloud-metadata /
     OT segment) AND the target matches the indicator of the originating alert.
     Returns (allowed: bool, reason: str)."""
-    if not target or target == "Unknown":
+    if not target or str(target).strip().lower() == "unknown":
         return (False, "no target supplied by the router")
     resolved = _resolve_targets(target)
     if not resolved:
@@ -78,9 +78,14 @@ def validate_scan_target(target, originating_indicator):
     # the safe default; supply it to restore scanning of validated externals.
     if not originating_indicator:
         return (False, "no originating-alert indicator to bind the target to (WIRE THIS)")
-    if str(target) != str(originating_indicator):
-        return (False, f"target '{target}' does not match originating indicator '{originating_indicator}'")
-    return (True, "allowed")
+    # Match by literal string or by resolved-address overlap, so a domain target
+    # validates against an IP indicator it resolves to (and vice versa).
+    if str(target) == str(originating_indicator):
+        return (True, "allowed")
+    indicator_ips = set(_resolve_targets(originating_indicator))
+    if indicator_ips and set(resolved) & indicator_ips:
+        return (True, "allowed (resolved-address match)")
+    return (False, f"target '{target}' does not match originating indicator '{originating_indicator}'")
 
 
 # Integration in counter_recon(): after reading the typed router argument,
