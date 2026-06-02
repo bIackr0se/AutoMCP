@@ -856,26 +856,32 @@ async def counter_recon(state: AppState):
 
     # Resolve-then-validate: reject unless every resolved address is outside the
     # deny-list (private/loopback/link-local/cloud-metadata/OT) AND the target
-    # matches an originating alert's indicator (see validate_scan_target).
+    # resolves onto an originating alert's indicator (see validate_scan_target).
     originating_indicators = _extract_originating_indicator(state)
-    allowed, reason = validate_scan_target(target, originating_indicators)
+    allowed, reason, scan_ip = validate_scan_target(target, originating_indicators)
     if not allowed:
         return {"messages": messages + [AIMessage(content=f"Scan refused by target validation: {reason}.")]}
 
-    print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target}")
+    # M1 (Sec 5.1): scan the validated, deny-list-cleared IP the gate returned, NOT
+    # the original hostname. Re-resolving the name inside the scanners would reopen
+    # a DNS-rebinding TOCTOU (a name allowed at validate time could resolve to an
+    # OT/internal address when nmap/http re-query it).
+    pinned = str(scan_ip)
+    print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target} (validated {pinned})")
 
     API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
-    
+
     results = await asyncio.gather(
-        run_otx_scan(target, API_KEY),
-        run_dns_scan(target),
-        run_whois_scan(target),
-        run_nmap_scan(target),
-        run_http_scan(target)
+        run_otx_scan(pinned, API_KEY),
+        run_dns_scan(pinned),
+        run_whois_scan(pinned),
+        run_nmap_scan(pinned),
+        run_http_scan(pinned)
     )
 
     recon_report = {
-        "target": target,
+        "target": pinned,
+        "requested_target": target,
         "threat_intel": results[0],
         "dns": results[1],
         "whois": results[2],
@@ -899,7 +905,7 @@ async def counter_recon(state: AppState):
     4. 🚀 **Action**: Block IP / Investigate Further / Ignore
     """
     
-    user_content = f"TARGET: {target}\n\nDATA:\n```json\n{json_output}\n```"
+    user_content = f"TARGET: {pinned}\n\nDATA:\n```json\n{json_output}\n```"
     
     analysis_response = await llm.ainvoke([
         SystemMessage(content=system_prompt),

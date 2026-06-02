@@ -39,6 +39,43 @@ from langchain_core.messages import SystemMessage, HumanMessage
 # set it to the deployment's actual protected ranges.
 _OT_SEGMENTS = [ipaddress.ip_network("10.10.0.0/24")]
 _CLOUD_METADATA = {ipaddress.ip_address("169.254.169.254")}
+_NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
+
+
+def _embedded_ipv4(ip):
+    """Return the IPv4 embedded in an IPv6 address, or None. Covers IPv4-mapped
+    (::ffff:a.b.c.d), the NAT64 well-known prefix (64:ff9b::a.b.c.d) and the
+    deprecated IPv4-compatible form (::a.b.c.d): all carry the v4 in the low 32
+    bits. Without this, an IPv6 encoding of a denied v4 (e.g. 64:ff9b::a0a:32 for
+    10.10.0.50) slips past is_private and the OT-segment test."""
+    if ip.version != 6:
+        return None
+    if ip.ipv4_mapped:
+        return ip.ipv4_mapped
+    if ip in _NAT64_PREFIX or (int(ip) >> 32) == 0:
+        low32 = int(ip) & 0xFFFFFFFF
+        if low32 > 1:  # skip :: and ::1 (loopback is handled separately)
+            try:
+                return ipaddress.IPv4Address(low32)
+            except ValueError:
+                return None
+    return None
+
+
+def _is_denied(ip):
+    """True if an address falls in any denied range (private / loopback /
+    link-local / cloud-metadata / OT segment), accounting for IPv6 encodings that
+    embed a denied IPv4."""
+    candidates = [ip]
+    emb = _embedded_ipv4(ip)
+    if emb is not None:
+        candidates.append(emb)
+    for c in candidates:
+        if c.is_private or c.is_loopback or c.is_link_local or c in _CLOUD_METADATA:
+            return True
+        if any(c in net for net in _OT_SEGMENTS):
+            return True
+    return False
 
 
 def _resolve_targets(target):
@@ -83,38 +120,45 @@ def _normalize_indicators(originating_indicators):
 def validate_scan_target(target, originating_indicators):
     """M1 gate. Allow a scan target only if EVERY address it resolves to is
     outside the deny-list (private / loopback / link-local / cloud-metadata /
-    OT segment) AND the target matches the indicator of an alert that triggered
-    the investigation (the origin-tie). `originating_indicators` is the set of
-    indicator addresses threaded from the most recent alert retrieval (see
-    _extract_originating_indicator in agent.py); a single string is also
-    accepted. Returns (allowed: bool, reason: str)."""
+    OT segment, incl. IPv6 encodings of denied v4) AND the target resolves onto
+    the indicator of an alert that triggered the investigation (the origin-tie).
+    `originating_indicators` are IP addresses threaded from the most recent alert
+    retrieval (see _extract_originating_indicator in agent.py); a single string
+    is also accepted.
+
+    Returns (allowed: bool, reason: str, validated_ip). validated_ip is the
+    deny-list-cleared, origin-tie-matched address the caller MUST scan directly:
+    scanning this pinned IP (instead of re-resolving the hostname) closes the
+    resolve-then-scan DNS-rebinding TOCTOU, since a name that resolves to an
+    allowed address here could resolve to a denied one when a scanner re-queries
+    it. None when not allowed."""
     if not target or str(target).strip().lower() == "unknown":
-        return (False, "no target supplied by the router")
+        return (False, "no target supplied by the router", None)
     resolved = _resolve_targets(target)
     if not resolved:
-        return (False, f"target '{target}' did not resolve")
+        return (False, f"target '{target}' did not resolve", None)
     for ip in resolved:
-        if ip.is_private or ip.is_loopback or ip.is_link_local or ip in _CLOUD_METADATA:
-            return (False, f"resolved address {ip} is in a denied range")
-        if any(ip in net for net in _OT_SEGMENTS):
-            return (False, f"resolved address {ip} is in a protected OT segment")
-    # Origin-tie: the scan target must be the indicator of an alert that
-    # triggered this investigation, threaded from the retrieval node. Fail closed
-    # when there is no originating alert (a scan unprompted by a retrieved alert
-    # is refused), which is the safe default.
+        if _is_denied(ip):
+            return (False, f"resolved address {ip} is in a denied range", None)
+    # Origin-tie: the scan target must resolve onto the IP indicator of an alert
+    # that triggered this investigation, threaded from the retrieval node. Fail
+    # closed when there is no originating alert (a scan unprompted by a retrieved
+    # alert is refused), which is the safe default.
     indicators = _normalize_indicators(originating_indicators)
     if not indicators:
-        return (False, "no originating-alert indicator to bind the target to")
-    # Match by literal string or by resolved-address overlap, so a domain target
-    # validates against an IP indicator it resolves to (and vice versa).
+        return (False, "no originating-alert indicator to bind the target to", None)
     resolved_set = set(resolved)
     for indicator in indicators:
-        if str(target) == indicator:
-            return (True, "allowed")
-        indicator_ips = set(_resolve_targets(indicator))
-        if indicator_ips and resolved_set & indicator_ips:
-            return (True, "allowed (resolved-address match)")
-    return (False, f"target '{target}' does not match any originating indicator {indicators}")
+        # Indicators are IPs (extract_indicators_from_alerts keeps IPs only); a
+        # literal IP target equals one, or a domain target resolves onto one. The
+        # matched indicator IP is what we pin and scan.
+        try:
+            ind_ip = ipaddress.ip_address(str(indicator))
+        except ValueError:
+            continue
+        if ind_ip in resolved_set:
+            return (True, "allowed", ind_ip)
+    return (False, f"target '{target}' does not match any originating indicator {indicators}", None)
 
 
 def _dig(alert, *path):
@@ -140,9 +184,11 @@ def extract_indicators_from_alerts(alerts):
     host.ip) of the retrieved alerts, as a sorted list of unique strings, so the
     scan target can be bound to an alert that actually triggered the
     investigation. Null fields are skipped; list-valued fields are flattened.
-    Under the deployed minimal projection host.ip is null and source.ip is not
-    projected, so this is empty and scans fail closed; a widened projection that
-    surfaces source.ip yields a real indicator."""
+    Only IP-valued entries are kept: a non-IP value (e.g. a hostname that slipped
+    into an IP field) is dropped so it cannot become an origin-tie anchor for a
+    rebinding target. Under the deployed minimal projection host.ip is null and
+    source.ip is not projected, so this is empty and scans fail closed; a widened
+    projection that surfaces source.ip yields a real indicator."""
     indicators = set()
     for alert in alerts or []:
         if not isinstance(alert, dict):
@@ -153,8 +199,13 @@ def extract_indicators_from_alerts(alerts):
                 continue
             for v in (val if isinstance(val, (list, tuple, set)) else [val]):
                 s = str(v).strip()
-                if s and s.lower() != "none":
-                    indicators.add(s)
+                if not s or s.lower() == "none":
+                    continue
+                try:
+                    ipaddress.ip_address(s)   # IP-only origin-tie anchors
+                except ValueError:
+                    continue
+                indicators.add(s)
     return sorted(indicators)
 
 
