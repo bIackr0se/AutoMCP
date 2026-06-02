@@ -16,14 +16,16 @@ from langgraph.types import interrupt
 # the import working whether agent.py is loaded as a script or as a package module. ---
 try:
     from mitigations import (
-        validate_scan_target,      # M1 (Sec 5.1) resolve-then-validate target gate
-        build_analyzer_messages,   # M3 (Sec 5.3) instruction-data separation
-        severity_aware_retain,     # M2 (Sec 5.2) severity-aware retention merge
-        _HIGH_SEVERITIES,          # M2 reserve-query severity values  >>> SCHEMA: verify
+        validate_scan_target,            # M1 (Sec 5.1) resolve-then-validate target gate
+        extract_indicators_from_alerts,  # M1 (Sec 5.1) origin-tie: indicators of retrieved alerts
+        build_analyzer_messages,         # M3 (Sec 5.3) instruction-data separation
+        severity_aware_retain,           # M2 (Sec 5.2) severity-aware retention merge
+        _HIGH_SEVERITIES,                # M2 reserve-query severity values  >>> SCHEMA: verify
     )
 except ImportError:
     from .mitigations import (
         validate_scan_target,
+        extract_indicators_from_alerts,
         build_analyzer_messages,
         severity_aware_retain,
         _HIGH_SEVERITIES,
@@ -255,7 +257,13 @@ class QueryAlertParams(BaseModel):
 # State Class
 class AppState(MessagesState):
     # Optional dictionary to store structured attack analysis data
-    attack_analysis: Optional[dict] 
+    attack_analysis: Optional[dict]
+    # M1 (Sec 5.1) origin-tie: indicator addresses (source.ip / host.ip) of the
+    # most recently retrieved alerts. Written by execute_elastic_query and read
+    # by counter_recon (via _extract_originating_indicator) so a scan target is
+    # bound to the alert that triggered the investigation. Absent until a query
+    # retrieves alerts, so a scan with no preceding retrieval fails closed.
+    originating_indicators: Optional[list[str]]
 
 # ====================
 
@@ -397,6 +405,9 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         processed_data['aggregations'] = response.get('aggregations', {})
         processed_data['total_hits'] = response.get('hits', {}).get('total', {}).get('value', 0)
     
+    alert_indicators = None
+    if params.aggregation:
+        pass
     else:
         hits = response.get('hits', {}).get('hits', [])
         clean_alerts = [hit.get('_source') for hit in hits if hit.get('_source')]
@@ -407,18 +418,28 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         processed_data['hits_returned'] = len(clean_alerts)
         processed_data['alerts'] = clean_alerts
 
+        # M1 (Sec 5.1) origin-tie: thread the structured indicators of the
+        # retrieved alerts into state so counter_recon can bind a scan target to
+        # the alert that triggered the investigation.
+        alert_indicators = extract_indicators_from_alerts(clean_alerts)
+
     structured_response = {
         "query_parameters": params.model_dump(exclude_none=True),
-        "data": processed_data 
+        "data": processed_data
     }
 
-    return {
+    result = {
         "messages": [
-            AIMessage(   
+            AIMessage(
                 content= "Elastic Query Result:\n" + json.dumps(structured_response, indent=2, default=str)
             )
         ]
     }
+    # Only an alert retrieval (not an aggregation) defines a fresh originating
+    # alert; aggregation leaves any prior indicators in state untouched.
+    if alert_indicators is not None:
+        result["originating_indicators"] = alert_indicators
+    return result
 
 async def query_analyzer(state: AppState):
     query_result = state["messages"][-1].content
@@ -791,13 +812,13 @@ async def run_http_scan(target):
 # --- MAIN AGENT TOOL ---
 
 def _extract_originating_indicator(state: AppState):
-    """MITIGATION M1 helper. Return the indicator (e.g. source/host address) of
-    the alert that triggered this investigation, used to bind the scan target.
-    >>> WIRE: this stub returns None, so counter_recon fails closed (scans
-    refused) until you implement extraction from the retrieved-alert context in
-    `state`. Failing closed is safe (it blocks the weaponization vuln and matches
-    Sec 5.1); implement this to restore recon for validated external targets."""
-    return None
+    """MITIGATION M1 helper (Sec 5.1). Return the indicator addresses of the
+    alert(s) that triggered this investigation, used to bind the scan target.
+    These are threaded into state by execute_elastic_query from the structured
+    fields (source.ip / host.ip) of the retrieved alerts. Returns None/empty when
+    no alert was retrieved, in which case counter_recon fails closed (a scan
+    unprompted by a retrieved alert is refused), matching Sec 5.1."""
+    return state.get("originating_indicators")
 
 
 async def counter_recon(state: AppState):
@@ -823,9 +844,9 @@ async def counter_recon(state: AppState):
 
     # Resolve-then-validate: reject unless every resolved address is outside the
     # deny-list (private/loopback/link-local/cloud-metadata/OT) AND the target
-    # matches the originating alert's indicator (see validate_scan_target).
-    originating_indicator = _extract_originating_indicator(state)
-    allowed, reason = validate_scan_target(target, originating_indicator)
+    # matches an originating alert's indicator (see validate_scan_target).
+    originating_indicators = _extract_originating_indicator(state)
+    allowed, reason = validate_scan_target(target, originating_indicators)
     if not allowed:
         return {"messages": messages + [AIMessage(content=f"Scan refused by target validation: {reason}.")]}
 

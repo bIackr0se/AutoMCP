@@ -6,18 +6,22 @@ Maps to the three matched mitigations in the SHIELD-AI paper, Section 5:
   - M2 / Sec 5.2  Severity-Aware Retention
   - M3 / Sec 5.3  Instruction-Data Separation with a Review Gate
 
-STATUS. M3 and the M1 deny-list/resolve checks are complete and
-schema-independent. Items marked  >>> WIRE / >>> SCHEMA / >>> GATE  need the
-live Elasticsearch schema or the LangGraph state and MUST be completed and
-runtime-tested against the deployed agent before this is treated as the
-deployed "patched state". Do NOT report a measured mitigation effect until the
-post-fix attack rates are actually run.
+STATUS. M1 (including the origin-tie), M2 and M3 are complete and wired into
+agent.py. The M1 origin-tie reads the indicators of the retrieved alerts, which
+execute_elastic_query threads into AppState; counter_recon binds the scan target
+to them via validate_scan_target. Items marked >>> SCHEMA / >>> GATE still need
+the live Elasticsearch schema or a graph-edge change before they harden the
+standby path. Do NOT report a measured mitigation effect until the post-fix
+attack rates are actually run against the deployed agent.
 
 Integration targets in agent.py (the 1004-line deployed version):
   - query_analyzer()         -> use build_analyzer_messages() (M3, drop-in)
   - counter_recon()          -> gate the target with validate_scan_target() (M1)
   - execute_elastic_query()  -> replace the size=3 branch with severity-aware
-                                retention via severity_aware_retain() (M2)
+                                retention via severity_aware_retain() (M2), and
+                                emit extract_indicators_from_alerts() into state
+                                so the M1 origin-tie has the originating alert
+  - AppState                 -> carries originating_indicators for the origin-tie
 """
 
 import json
@@ -57,11 +61,33 @@ def _resolve_targets(target):
     return list(addrs)
 
 
-def validate_scan_target(target, originating_indicator):
+def _normalize_indicators(originating_indicators):
+    """Accept a single indicator string, an iterable of them, or None; return a
+    list of non-empty indicator strings. Lets validate_scan_target take either a
+    single originating indicator or the set surfaced by a retrieval."""
+    if originating_indicators is None:
+        return []
+    if isinstance(originating_indicators, (str, bytes)):
+        s = originating_indicators.decode() if isinstance(originating_indicators, bytes) else originating_indicators
+        return [s] if s.strip() else []
+    out = []
+    for ind in originating_indicators:
+        if ind is None:
+            continue
+        s = str(ind).strip()
+        if s and s.lower() != "none":
+            out.append(s)
+    return out
+
+
+def validate_scan_target(target, originating_indicators):
     """M1 gate. Allow a scan target only if EVERY address it resolves to is
     outside the deny-list (private / loopback / link-local / cloud-metadata /
-    OT segment) AND the target matches the indicator of the originating alert.
-    Returns (allowed: bool, reason: str)."""
+    OT segment) AND the target matches the indicator of an alert that triggered
+    the investigation (the origin-tie). `originating_indicators` is the set of
+    indicator addresses threaded from the most recent alert retrieval (see
+    _extract_originating_indicator in agent.py); a single string is also
+    accepted. Returns (allowed: bool, reason: str)."""
     if not target or str(target).strip().lower() == "unknown":
         return (False, "no target supplied by the router")
     resolved = _resolve_targets(target)
@@ -72,32 +98,74 @@ def validate_scan_target(target, originating_indicator):
             return (False, f"resolved address {ip} is in a denied range")
         if any(ip in net for net in _OT_SEGMENTS):
             return (False, f"resolved address {ip} is in a protected OT segment")
-    # >>> WIRE: originating_indicator must be the indicator (e.g. the source or
-    # host field) of the alert that triggered this investigation, threaded in
-    # from state. Until it is wired this fails closed (scans refused), which is
-    # the safe default; supply it to restore scanning of validated externals.
-    if not originating_indicator:
-        return (False, "no originating-alert indicator to bind the target to (WIRE THIS)")
+    # Origin-tie: the scan target must be the indicator of an alert that
+    # triggered this investigation, threaded from the retrieval node. Fail closed
+    # when there is no originating alert (a scan unprompted by a retrieved alert
+    # is refused), which is the safe default.
+    indicators = _normalize_indicators(originating_indicators)
+    if not indicators:
+        return (False, "no originating-alert indicator to bind the target to")
     # Match by literal string or by resolved-address overlap, so a domain target
     # validates against an IP indicator it resolves to (and vice versa).
-    if str(target) == str(originating_indicator):
-        return (True, "allowed")
-    indicator_ips = set(_resolve_targets(originating_indicator))
-    if indicator_ips and set(resolved) & indicator_ips:
-        return (True, "allowed (resolved-address match)")
-    return (False, f"target '{target}' does not match originating indicator '{originating_indicator}'")
+    resolved_set = set(resolved)
+    for indicator in indicators:
+        if str(target) == indicator:
+            return (True, "allowed")
+        indicator_ips = set(_resolve_targets(indicator))
+        if indicator_ips and resolved_set & indicator_ips:
+            return (True, "allowed (resolved-address match)")
+    return (False, f"target '{target}' does not match any originating indicator {indicators}")
 
 
-# Integration in counter_recon(): after reading the typed router argument,
-# DELETE the free-text fallback
-#     recent_text = " ".join([m.content for m in state["messages"][-3:] ...])
-#     ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', recent_text)
-#     target = ips[0] if ips else "Unknown"
-# and replace the target check with:
-#     originating_indicator = None   # >>> WIRE from the triggering alert
-#     allowed, reason = validate_scan_target(target, originating_indicator)
+def _dig(alert, *path):
+    """Pull a possibly-nested or dotted field from an Elasticsearch _source dict.
+    Handles both the nested form {"host": {"ip": ...}} and the dotted form
+    {"host.ip": ...} that different _source projections can return."""
+    if not isinstance(alert, dict):
+        return None
+    dotted = ".".join(path)
+    if dotted in alert:
+        return alert[dotted]
+    cur = alert
+    for key in path:
+        if isinstance(cur, dict) and key in cur:
+            cur = cur[key]
+        else:
+            return None
+    return cur
+
+
+def extract_indicators_from_alerts(alerts):
+    """M1 origin-tie support. Return the indicator addresses (source.ip and
+    host.ip) of the retrieved alerts, as a sorted list of unique strings, so the
+    scan target can be bound to an alert that actually triggered the
+    investigation. Null fields are skipped; list-valued fields are flattened.
+    Under the deployed minimal projection host.ip is null and source.ip is not
+    projected, so this is empty and scans fail closed; a widened projection that
+    surfaces source.ip yields a real indicator."""
+    indicators = set()
+    for alert in alerts or []:
+        if not isinstance(alert, dict):
+            continue
+        for field in (("source", "ip"), ("host", "ip")):
+            val = _dig(alert, *field)
+            if val is None:
+                continue
+            for v in (val if isinstance(val, (list, tuple, set)) else [val]):
+                s = str(v).strip()
+                if s and s.lower() != "none":
+                    indicators.add(s)
+    return sorted(indicators)
+
+
+# Integration in counter_recon(): the free-text IPv4 fallback is removed; the
+# target comes only from the typed router argument and is gated with
+#     originating_indicators = _extract_originating_indicator(state)
+#     allowed, reason = validate_scan_target(target, originating_indicators)
 #     if not allowed:
 #         return {"messages": messages + [AIMessage(content=f"Scan refused: {reason}.")]}
+# where _extract_originating_indicator reads the originating_indicators that
+# execute_elastic_query wrote into AppState from the retrieved alerts.
 
 
 # ---------------------------------------------------------------------------
