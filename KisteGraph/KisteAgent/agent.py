@@ -385,20 +385,17 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
             return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
         # MITIGATION M2 (Sec 5.2): one bounded reserve query for high-severity
         # alerts, merged below so a critical alert is not displaced by benign
-        # volume. It inherits the main query's context filters (host, rule, date)
-        # so the reserve stays scoped to the user's request, then adds the
-        # severity constraint. Safe fallback: on error or empty reserve, retention
-        # falls back to recency-only (the original behaviour).
-        if not params.aggregation:
+        # volume in the DEFAULT recency view. It runs ONLY when the user did not
+        # constrain severity: an explicit severity filter (e.g. "low") is honored
+        # as-is, so the reserve never injects high-severity alerts into a query
+        # that asked for other severities. It inherits the main query's context
+        # filters (host, rule, date) so the reserve stays scoped to the request.
+        # Safe fallback: on error or empty reserve, retention falls back to
+        # recency-only (the original behaviour).
+        if not params.aggregation and not params.severity:
             try:
-                # Inherit the main query's context filters but drop any severity
-                # clause, so the high-severity reserve is not ANDed into an
-                # impossible query when the user filtered on a non-high severity.
-                context_filters = [f for f in filters if not (
-                    isinstance(f, dict) and "kibana.alert.rule.parameters.severity" in f.get("terms", {})
-                )]
                 reserve_query = {
-                    "query": {"bool": {"must": context_filters + [
+                    "query": {"bool": {"must": filters + [
                         {"terms": {"kibana.alert.rule.parameters.severity": _HIGH_SEVERITIES}}
                     ]}},
                     "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],
@@ -793,7 +790,18 @@ async def run_http_scan(target, host_header=None):
     name."""
     results = {"status": "Unreachable", "headers": {}}
 
-    url = target if target.startswith("http") else f"https://{target}"
+    if target.startswith("http"):
+        url = target
+    else:
+        # A literal IPv6 address must be bracketed in a URL (https://[::1]);
+        # hostnames and IPv4 are used as-is.
+        host = target
+        try:
+            if ipaddress.ip_address(target).version == 6:
+                host = f"[{target}]"
+        except ValueError:
+            pass
+        url = f"https://{host}"
 
     fake_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
@@ -813,9 +821,11 @@ async def run_http_scan(target, host_header=None):
                 results["headers"][k] = v
                 
     except requests.exceptions.SSLError:
-        if url.startswith("https"):
+        if url.startswith("https://"):
             try:
-                http_url = url.replace("https", "http")
+                # Swap only the scheme prefix; a host containing "https" must not
+                # be mutated (url.replace would corrupt it and target a wrong host).
+                http_url = "http://" + url[len("https://"):]
                 resp = await asyncio.to_thread(requests.head, http_url, headers=fake_headers, timeout=10)
                 results["status"] = resp.status_code
                 results["url"] = http_url
