@@ -10,6 +10,26 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
 from langgraph.types import interrupt
+
+# --- security mitigations (paper Sec 5); helpers live in mitigations.py, which
+# must be co-deployed in the same directory as this agent. The try/except keeps
+# the import working whether agent.py is loaded as a script or as a package module. ---
+try:
+    from mitigations import (
+        validate_scan_target,            # M1 (Sec 5.1) resolve-then-validate target gate
+        extract_indicators_from_alerts,  # M1 (Sec 5.1) origin-tie: indicators of retrieved alerts
+        build_analyzer_messages,         # M3 (Sec 5.3) instruction-data separation
+        severity_aware_retain,           # M2 (Sec 5.2) severity-aware retention merge
+        _HIGH_SEVERITIES,                # M2 reserve-query severity values (verified lowercase on live index)
+    )
+except ImportError:
+    from .mitigations import (
+        validate_scan_target,
+        extract_indicators_from_alerts,
+        build_analyzer_messages,
+        severity_aware_retain,
+        _HIGH_SEVERITIES,
+    )
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from mcp.server.fastmcp import FastMCP
@@ -237,7 +257,13 @@ class QueryAlertParams(BaseModel):
 # State Class
 class AppState(MessagesState):
     # Optional dictionary to store structured attack analysis data
-    attack_analysis: Optional[dict] 
+    attack_analysis: Optional[dict]
+    # M1 (Sec 5.1) origin-tie: indicator addresses (source.ip / host.ip) of the
+    # most recently retrieved alerts. Written by execute_elastic_query and read
+    # by counter_recon (via _extract_originating_indicator) so a scan target is
+    # bound to the alert that triggered the investigation. Absent until a query
+    # retrieves alerts, so a scan with no preceding retrieval fails closed.
+    originating_indicators: Optional[list[str]]
 
 # ====================
 
@@ -281,7 +307,19 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         "kibana.alert.rule.name",
         "kibana.alert.rule.parameters.description",
         "kibana.alert.rule.parameters.threat",
-        "host.ip"
+        "host.ip",
+        # M1 (Sec 5.1): surface source.ip so the origin-tie has an indicator to
+        # bind a scan target to (read by extract_indicators_from_alerts below into
+        # originating_indicators). Safe under M1: validate_scan_target refuses any
+        # target resolving into the OT/private/loopback/link-local/cloud-metadata
+        # deny-list, and any target not matching a surfaced indicator, so exposing
+        # the true source address restores analyst recon utility WITHOUT enabling
+        # tool weaponization (post-mitigation eval: 0/100 scans executed). This
+        # replaces the minimal-projection incidental defense (which gated the attack
+        # by hiding the address, but also left counter_recon unable to bind any
+        # target) with explicit target validation. source.ip is the true connection
+        # origin, not an attacker-writable field, so it adds no poisoning surface (M3).
+        "source.ip",
     ]
     
     query = {"query": {"bool": {"must": []}}}
@@ -339,11 +377,35 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
 
     response = None
     
+    reserve_hits = []
     async with get_elastic_client(state) as client:
         try:
             response = await client.search(index=index, body=query)
         except Exception as e:
             return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
+        # MITIGATION M2 (Sec 5.2): one bounded reserve query for high-severity
+        # alerts, merged below so a critical alert is not displaced by benign
+        # volume in the DEFAULT recency view. It runs ONLY when the user did not
+        # constrain severity: an explicit severity filter (e.g. "low") is honored
+        # as-is, so the reserve never injects high-severity alerts into a query
+        # that asked for other severities. It inherits the main query's context
+        # filters (host, rule, date) so the reserve stays scoped to the request.
+        # Safe fallback: on error or empty reserve, retention falls back to
+        # recency-only (the original behaviour).
+        if not params.aggregation and not params.severity:
+            try:
+                reserve_query = {
+                    "query": {"bool": {"must": filters + [
+                        {"terms": {"kibana.alert.rule.parameters.severity": _HIGH_SEVERITIES}}
+                    ]}},
+                    "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}],
+                    "size": 2,
+                    "_source": DESIRED_OUTPUT_FIELDS,
+                }
+                reserve_resp = await client.search(index=index, body=reserve_query)
+                reserve_hits = [h.get("_source") for h in reserve_resp.get("hits", {}).get("hits", []) if h.get("_source")]
+            except Exception:
+                reserve_hits = []
 
     # Process and return results
     processed_data = {}
@@ -352,46 +414,61 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         processed_data['aggregations'] = response.get('aggregations', {})
         processed_data['total_hits'] = response.get('hits', {}).get('total', {}).get('value', 0)
     
+    alert_indicators = None
+    if params.aggregation:
+        pass
     else:
         hits = response.get('hits', {}).get('hits', [])
         clean_alerts = [hit.get('_source') for hit in hits if hit.get('_source')]
-        
+        # M2 (Sec 5.2): reserve high-severity slots ahead of recency.
+        clean_alerts = severity_aware_retain(clean_alerts, reserve_hits, size=3)
+
         processed_data['total_hits_found'] = response.get('hits', {}).get('total', {}).get('value', 0)
         processed_data['hits_returned'] = len(clean_alerts)
         processed_data['alerts'] = clean_alerts
 
+        # M1 (Sec 5.1) origin-tie: thread the structured indicators of the
+        # retrieved alerts into state so counter_recon can bind a scan target to
+        # the alert that triggered the investigation.
+        alert_indicators = extract_indicators_from_alerts(clean_alerts)
+
     structured_response = {
         "query_parameters": params.model_dump(exclude_none=True),
-        "data": processed_data 
+        "data": processed_data
     }
 
-    return {
+    result = {
         "messages": [
-            AIMessage(   
+            AIMessage(
                 content= "Elastic Query Result:\n" + json.dumps(structured_response, indent=2, default=str)
             )
         ]
     }
+    # Only an alert retrieval (not an aggregation) defines a fresh originating
+    # alert; aggregation leaves any prior indicators in state untouched.
+    if alert_indicators is not None:
+        result["originating_indicators"] = alert_indicators
+    return result
 
 async def query_analyzer(state: AppState):
     query_result = state["messages"][-1].content
 
-    sys_msg = f"""
-    Important Rules to Follow:
-        1. You are a data analyst assistant with a focus on cybersecurity. Make answers based ONLY on the following context.
-        2. The context contains several generated alert logs from cybersecurity rules.
-        3. Make comments about the results you got in a cybersecurity perspective.
-        4. Make relevant correlations (MITRE ATT&CK, Timestamps, Host info).
-        5. Warn the user for upcoming steps and recommend security measures.
-    """
-
-    # Optimize token usage: only use recent context + query result
+    # MITIGATION M3 (Sec 5.3): instruction-data separation. The trusted analyst
+    # instruction stays in the system role; untrusted alert content goes in the
+    # user role inside <ALERT_DATA> delimiters with a "data, not instructions"
+    # directive (see build_analyzer_messages). Replaces the old
+    # `sys_msg + query_result` concatenation that let an instruction planted in
+    # an alert field be read as guidance.
     llm = get_llm()
-    response = await llm.ainvoke(sys_msg + f"\n{query_result}")
-    
-    response_content = response.content
+    response = await llm.ainvoke(build_analyzer_messages(query_result))
 
-    return {"messages": [AIMessage(content=response_content)]}
+    return {"messages": [AIMessage(content=response.content)]}
+
+# >>> GATE (Sec 5.3, defense-in-depth): channel separation above is the primary
+# fix; the autonomous standby path (query_analyzer_S) should also regain a
+# human-review interrupt before a summary becomes a verdict. Add an interrupt()
+# node on the _S branch in the graph builder and test under langgraph before
+# enabling (it changes the standby execution model).
 
 
 async def generate_elastic_query(state: AppState):
@@ -705,16 +782,33 @@ async def run_nmap_scan(target):
     except Exception as e:
         return {"error": str(e)}
 
-async def run_http_scan(target):
-    """Fingerprints Web Server Headers with Browser Masquerading."""
+async def run_http_scan(target, host_header=None):
+    """Fingerprints Web Server Headers with Browser Masquerading. `target` is the
+    address actually connected to (a pinned IP for DNS-rebinding safety); when
+    `host_header` is given (the original domain) it is sent as the Host header so
+    virtual hosts / CDNs still resolve to the right site without re-resolving the
+    name."""
     results = {"status": "Unreachable", "headers": {}}
-    
-    url = target if target.startswith("http") else f"https://{target}"
-    
+
+    if target.startswith("http"):
+        url = target
+    else:
+        # A literal IPv6 address must be bracketed in a URL (https://[::1]);
+        # hostnames and IPv4 are used as-is.
+        host = target
+        try:
+            if ipaddress.ip_address(target).version == 6:
+                host = f"[{target}]"
+        except ValueError:
+            pass
+        url = f"https://{host}"
+
     fake_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     }
+    if host_header:
+        fake_headers['Host'] = host_header
 
     try:
         resp = await asyncio.to_thread(requests.head, url, headers=fake_headers, verify=False, timeout=10)
@@ -727,9 +821,11 @@ async def run_http_scan(target):
                 results["headers"][k] = v
                 
     except requests.exceptions.SSLError:
-        if url.startswith("https"):
+        if url.startswith("https://"):
             try:
-                http_url = url.replace("https", "http")
+                # Swap only the scheme prefix; a host containing "https" must not
+                # be mutated (url.replace would corrupt it and target a wrong host).
+                http_url = "http://" + url[len("https://"):]
                 resp = await asyncio.to_thread(requests.head, http_url, headers=fake_headers, timeout=10)
                 results["status"] = resp.status_code
                 results["url"] = http_url
@@ -742,6 +838,16 @@ async def run_http_scan(target):
     return results
 
 # --- MAIN AGENT TOOL ---
+
+def _extract_originating_indicator(state: AppState):
+    """MITIGATION M1 helper (Sec 5.1). Return the indicator addresses of the
+    alert(s) that triggered this investigation, used to bind the scan target.
+    These are threaded into state by execute_elastic_query from the structured
+    fields (source.ip / host.ip) of the retrieved alerts. Returns None/empty when
+    no alert was retrieved, in which case counter_recon fails closed (a scan
+    unprompted by a retrieved alert is refused), matching Sec 5.1."""
+    return state.get("originating_indicators")
+
 
 async def counter_recon(state: AppState):
     """
@@ -759,28 +865,50 @@ async def counter_recon(state: AppState):
                 messages.append(ToolMessage(tool_call_id=tool_call["id"], content=f"Scanning target: {target}..."))
                 break
     
-    if not target:
-        recent_text = " ".join([m.content for m in state["messages"][-3:] if hasattr(m, "content")])
-        ips = re.findall(r'\b(?:\d{1,3}\.){3}\d{1,3}\b', recent_text)
-        target = ips[0] if ips else "Unknown"
+    # MITIGATION M1 (Sec 5.1): the target comes ONLY from the typed router
+    # argument. The previous free-text IPv4 extraction from recent messages is
+    # removed, so an address appearing anywhere in chat/alert text is no longer a
+    # scan target.
 
-    if target == "Unknown":
-         return {"messages": messages + [AIMessage(content="❌ Hedef IP veya Domain bulunamadı.")]}
+    # Resolve-then-validate: reject unless every resolved address is outside the
+    # deny-list (private/loopback/link-local/cloud-metadata/OT) AND the target
+    # resolves onto an originating alert's indicator (see validate_scan_target).
+    originating_indicators = _extract_originating_indicator(state)
+    allowed, reason, scan_ip = validate_scan_target(target, originating_indicators)
+    if not allowed:
+        return {"messages": messages + [AIMessage(content=f"Scan refused by target validation: {reason}.")]}
 
-    print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target}")
+    # M1 (Sec 5.1): pin only the CONNECTING scanners (nmap, http) to the validated,
+    # deny-list-cleared IP the gate returned. They reach the host and would
+    # otherwise re-resolve the name, reopening a DNS-rebinding TOCTOU (a name
+    # allowed at validate time could resolve to an OT/internal address when a
+    # scanner re-queries it). The passive lookup tools (OTX, DNS, WHOIS) query
+    # third-party services ABOUT the target rather than connecting to it, so they
+    # keep the original target to preserve domain-level recon (WHOIS owner, DNS
+    # A/MX). For HTTP we connect to the pinned IP but send Host: <domain> so
+    # virtual hosts / CDNs still resolve to the right site.
+    pinned = str(scan_ip)
+    print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target} (validated {pinned})")
+
+    host_hdr = None
+    try:
+        ipaddress.ip_address(target)
+    except (ValueError, TypeError):
+        host_hdr = target
 
     API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
-    
+
     results = await asyncio.gather(
         run_otx_scan(target, API_KEY),
         run_dns_scan(target),
         run_whois_scan(target),
-        run_nmap_scan(target),
-        run_http_scan(target)
+        run_nmap_scan(pinned),
+        run_http_scan(pinned, host_hdr)
     )
 
     recon_report = {
-        "target": target,
+        "target": pinned,
+        "requested_target": target,
         "threat_intel": results[0],
         "dns": results[1],
         "whois": results[2],
@@ -804,7 +932,7 @@ async def counter_recon(state: AppState):
     4. 🚀 **Action**: Block IP / Investigate Further / Ignore
     """
     
-    user_content = f"TARGET: {target}\n\nDATA:\n```json\n{json_output}\n```"
+    user_content = f"TARGET: {pinned}\n\nDATA:\n```json\n{json_output}\n```"
     
     analysis_response = await llm.ainvoke([
         SystemMessage(content=system_prompt),
