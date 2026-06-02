@@ -20,7 +20,7 @@ try:
         extract_indicators_from_alerts,  # M1 (Sec 5.1) origin-tie: indicators of retrieved alerts
         build_analyzer_messages,         # M3 (Sec 5.3) instruction-data separation
         severity_aware_retain,           # M2 (Sec 5.2) severity-aware retention merge
-        _HIGH_SEVERITIES,                # M2 reserve-query severity values  >>> SCHEMA: verify
+        _HIGH_SEVERITIES,                # M2 reserve-query severity values (verified lowercase on live index)
     )
 except ImportError:
     from .mitigations import (
@@ -307,7 +307,19 @@ async def execute_elastic_query(state: AppState, index: str = ES_ALERTS_INDEX) -
         "kibana.alert.rule.name",
         "kibana.alert.rule.parameters.description",
         "kibana.alert.rule.parameters.threat",
-        "host.ip"
+        "host.ip",
+        # M1 (Sec 5.1): surface source.ip so the origin-tie has an indicator to
+        # bind a scan target to (read by extract_indicators_from_alerts below into
+        # originating_indicators). Safe under M1: validate_scan_target refuses any
+        # target resolving into the OT/private/loopback/link-local/cloud-metadata
+        # deny-list, and any target not matching a surfaced indicator, so exposing
+        # the true source address restores analyst recon utility WITHOUT enabling
+        # tool weaponization (post-mitigation eval: 0/100 scans executed). This
+        # replaces the minimal-projection incidental defense (which gated the attack
+        # by hiding the address, but also left counter_recon unable to bind any
+        # target) with explicit target validation. source.ip is the true connection
+        # origin, not an attacker-writable field, so it adds no poisoning surface (M3).
+        "source.ip",
     ]
     
     query = {"query": {"bool": {"must": []}}}

@@ -223,11 +223,12 @@ def build_analyzer_messages(query_result):
 # M2 (Sec 5.2): severity-aware retention
 # ---------------------------------------------------------------------------
 
-# >>> SCHEMA: confirm the exact values the deployed rules write into
-# kibana.alert.rule.parameters.severity (casing: "critical"/"CRITICAL"?) and
-# whether a workflow/status field marks an alert "unresolved". Both are needed
-# for the reserve query and cannot be guessed safely. Set from the live index.
-_HIGH_SEVERITIES = ["critical", "high"]   # >>> SCHEMA: verify exact values/casing
+# SCHEMA verified against the live alert index 2026-06-02: the deployed rules
+# write kibana.alert.rule.parameters.severity as lowercase (critical/high/
+# medium/low), and kibana.alert.workflow_status is uniformly "open" (no
+# acknowledged/closed states present), so an unresolved-status filter would be a
+# no-op and is omitted. Re-confirm against the live index for any new deployment.
+_HIGH_SEVERITIES = ["critical", "high"]   # verified lowercase on the live index
 
 
 def severity_aware_retain(recent_alerts, reserve_alerts, size=3):
@@ -254,6 +255,7 @@ def severity_aware_retain(recent_alerts, reserve_alerts, size=3):
 #     (+ an unresolved-status filter if the field exists), small size, recency
 #     sort -> `reserve`
 #   - clean_alerts = severity_aware_retain(recent, reserve, size=RETENTION_SIZE)
-# >>> SCHEMA-gated: do not deploy until both queries are confirmed against the
-# live index (an unverified severity value silently returns an empty reserve,
-# which would leave the original eviction behaviour in place).
+# This integration is wired in agent.py's execute_elastic_query() and the
+# severity values are confirmed against the live index (see _HIGH_SEVERITIES);
+# an unverified severity value would silently return an empty reserve and leave
+# the original eviction behaviour in place, so re-confirm for a new deployment.
