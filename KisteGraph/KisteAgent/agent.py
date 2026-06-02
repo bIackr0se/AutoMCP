@@ -785,16 +785,22 @@ async def run_nmap_scan(target):
     except Exception as e:
         return {"error": str(e)}
 
-async def run_http_scan(target):
-    """Fingerprints Web Server Headers with Browser Masquerading."""
+async def run_http_scan(target, host_header=None):
+    """Fingerprints Web Server Headers with Browser Masquerading. `target` is the
+    address actually connected to (a pinned IP for DNS-rebinding safety); when
+    `host_header` is given (the original domain) it is sent as the Host header so
+    virtual hosts / CDNs still resolve to the right site without re-resolving the
+    name."""
     results = {"status": "Unreachable", "headers": {}}
-    
+
     url = target if target.startswith("http") else f"https://{target}"
-    
+
     fake_headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8'
     }
+    if host_header:
+        fake_headers['Host'] = host_header
 
     try:
         resp = await asyncio.to_thread(requests.head, url, headers=fake_headers, verify=False, timeout=10)
@@ -862,21 +868,32 @@ async def counter_recon(state: AppState):
     if not allowed:
         return {"messages": messages + [AIMessage(content=f"Scan refused by target validation: {reason}.")]}
 
-    # M1 (Sec 5.1): scan the validated, deny-list-cleared IP the gate returned, NOT
-    # the original hostname. Re-resolving the name inside the scanners would reopen
-    # a DNS-rebinding TOCTOU (a name allowed at validate time could resolve to an
-    # OT/internal address when nmap/http re-query it).
+    # M1 (Sec 5.1): pin only the CONNECTING scanners (nmap, http) to the validated,
+    # deny-list-cleared IP the gate returned. They reach the host and would
+    # otherwise re-resolve the name, reopening a DNS-rebinding TOCTOU (a name
+    # allowed at validate time could resolve to an OT/internal address when a
+    # scanner re-queries it). The passive lookup tools (OTX, DNS, WHOIS) query
+    # third-party services ABOUT the target rather than connecting to it, so they
+    # keep the original target to preserve domain-level recon (WHOIS owner, DNS
+    # A/MX). For HTTP we connect to the pinned IP but send Host: <domain> so
+    # virtual hosts / CDNs still resolve to the right site.
     pinned = str(scan_ip)
     print(f"\n[AGENT] 🛡️ Starting 'Voltran' Reconnaissance for: {target} (validated {pinned})")
+
+    host_hdr = None
+    try:
+        ipaddress.ip_address(target)
+    except (ValueError, TypeError):
+        host_hdr = target
 
     API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
 
     results = await asyncio.gather(
-        run_otx_scan(pinned, API_KEY),
-        run_dns_scan(pinned),
-        run_whois_scan(pinned),
+        run_otx_scan(target, API_KEY),
+        run_dns_scan(target),
+        run_whois_scan(target),
         run_nmap_scan(pinned),
-        run_http_scan(pinned)
+        run_http_scan(pinned, host_hdr)
     )
 
     recon_report = {
