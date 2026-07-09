@@ -38,6 +38,7 @@ from elasticsearch import AsyncElasticsearch
 from contextlib import asynccontextmanager
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
+from langchain_openai import ChatOpenAI
 from pathlib import Path
 import socket
 import shutil
@@ -54,26 +55,39 @@ import urllib3
 DEFAULT_MODEL = "qwen2.5:3b"
 DEFAULT_BACKEND = "ollama"
 
+# Open WebUI backend (University of Freiburg RZ instance): an OpenAI-compatible
+# endpoint, so it's wired through ChatOpenAI rather than a bespoke client.
+# standard-chat-ufr is the RZ-curated preset backed by an internal (data stays
+# on university infra), data-center-hosted model -- picked as the default so a
+# provider switch never silently changes the data-locality guarantee local
+# Ollama gave CoAnalyst. Override OPENWEBUI_MODEL to target another catalog
+# entry, e.g. one of the pinned llmlb ids (glm-5.1-llmlb, qwen-3.5-397b-llmlb)
+# for reproducibility work where the model identity must not drift.
+OPENWEBUI_BASE_URL = os.environ.get(
+    "OPENWEBUI_BASE_URL", "https://openwebui.uni-freiburg.de/api"
+)
+OPENWEBUI_MODEL = os.environ.get("OPENWEBUI_MODEL", "standard-chat-ufr")
+
 # Cache for the selected backend (set once at startup)
 _selected_backend: Optional[str] = None
 
 def get_llm_backend() -> str:
     """
     Get the selected LLM backend. Prompts user for selection on first call.
-    Returns 'ollama' (default) or 'groq'.
+    Returns 'ollama' (default), 'groq', or 'openwebui'.
     """
     global _selected_backend
-    
+
     if _selected_backend is not None:
         return _selected_backend
-    
+
     # Check for environment variable override
     env_backend = os.environ.get("LLM_BACKEND", "").lower()
-    if env_backend in ["ollama", "groq"]:
+    if env_backend in ["ollama", "groq", "openwebui"]:
         _selected_backend = env_backend
         print(f"[LLM] Using backend from environment: {_selected_backend}")
         return _selected_backend
-    
+
     # Prompt user for selection
     print("\n" + "=" * 50)
     print("🤖 LLM Backend Selection")
@@ -82,50 +96,66 @@ def get_llm_backend() -> str:
     print("\nAvailable backends:")
     print("  1. ollama (default) - Local LLM via Ollama")
     print("  2. groq - Cloud LLM via Groq API")
-    print("\nPress Enter for default (ollama), or type 'groq':")
-    
+    print("  3. openwebui - University of Freiburg Open WebUI (OpenAI-compatible)")
+    print("\nPress Enter for default (ollama), or type 'groq' / 'openwebui':")
+
     try:
         choice = input(">>> ").strip().lower()
     except EOFError:
         # Non-interactive mode, use default
         choice = ""
-    
+
     if choice == "groq" or choice == "2":
         _selected_backend = "groq"
         # Verify GROQ_API_KEY is set
         if not os.environ.get("GROQ_API_KEY"):
             print("⚠️  Warning: GROQ_API_KEY not found. API calls will fail. Please set it as environment variable.")
+    elif choice == "openwebui" or choice == "3":
+        _selected_backend = "openwebui"
+        if not os.environ.get("OPENWEBUI_API_KEY"):
+            print("⚠️  Warning: OPENWEBUI_API_KEY not found. API calls will fail. Please set it as environment variable.")
     else:
         _selected_backend = "ollama"
-    
+
     print(f"[LLM] Selected backend: {_selected_backend}")
     print("=" * 50 + "\n")
-    
+
     return _selected_backend
 
 def get_llm(temperature: float = 0, model: Optional[str] = None):
     """
     Factory function to create the appropriate LLM instance based on user selection.
-    Supports ollama (default) or groq as an alternative backend.
-    
+    Supports ollama (default), groq, or openwebui as alternative backends.
+
     Args:
         temperature: Temperature setting for the LLM (default: 0)
-        model: Model name (default: qwen2.5:3b for both backends)
-    
+        model: Model name (default: qwen2.5:3b for ollama/groq, OPENWEBUI_MODEL for openwebui)
+
     Returns:
-        ChatOllama or ChatGroq instance
-    
+        ChatOllama, ChatGroq, or ChatOpenAI instance
+
     Raises:
-        ValueError: If groq backend is selected but GROQ_API_KEY is not set
+        ValueError: If groq/openwebui backend is selected but its API key is not set
     """
     backend = get_llm_backend()
-    model_name = model or DEFAULT_MODEL
-    
+
     if backend == "groq":
         if not os.environ.get("GROQ_API_KEY"):
             raise ValueError("GROQ_API_KEY environment variable is required when using groq backend")
+        model_name = model or DEFAULT_MODEL
         return ChatGroq(model=model_name, temperature=temperature)
+    elif backend == "openwebui":
+        if not os.environ.get("OPENWEBUI_API_KEY"):
+            raise ValueError("OPENWEBUI_API_KEY environment variable is required when using openwebui backend")
+        model_name = model or OPENWEBUI_MODEL
+        return ChatOpenAI(
+            model=model_name,
+            temperature=temperature,
+            base_url=OPENWEBUI_BASE_URL,
+            api_key=os.environ["OPENWEBUI_API_KEY"],
+        )
     else:
+        model_name = model or DEFAULT_MODEL
         return ChatOllama(model=model_name, temperature=temperature)
 
 # ====================
