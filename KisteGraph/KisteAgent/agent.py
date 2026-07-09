@@ -935,10 +935,12 @@ async def counter_recon(state: AppState):
     except (ValueError, TypeError):
         host_hdr = target
 
-    API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
+    otx_api_key = os.getenv("OTX_API_KEY", "")
+    if not otx_api_key:
+        print("WARNING: OTX_API_KEY not set; run_otx_scan will fail closed with no threat-intel enrichment.")
 
     results = await asyncio.gather(
-        run_otx_scan(target, API_KEY),
+        run_otx_scan(target, otx_api_key),
         run_dns_scan(target),
         run_whois_scan(target),
         run_nmap_scan(pinned),
