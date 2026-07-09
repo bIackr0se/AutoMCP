@@ -92,11 +92,10 @@ def get_llm_backend() -> str:
     print("\n" + "=" * 50)
     print("🤖 LLM Backend Selection")
     print("=" * 50)
-    print(f"Default model: {DEFAULT_MODEL}")
     print("\nAvailable backends:")
-    print("  1. ollama (default) - Local LLM via Ollama")
-    print("  2. groq - Cloud LLM via Groq API")
-    print("  3. openwebui - University of Freiburg Open WebUI (OpenAI-compatible)")
+    print(f"  1. ollama (default) - Local LLM via Ollama [{DEFAULT_MODEL}]")
+    print(f"  2. groq - Cloud LLM via Groq API [{DEFAULT_MODEL}]")
+    print(f"  3. openwebui - University of Freiburg Open WebUI (OpenAI-compatible) [{OPENWEBUI_MODEL}]")
     print("\nPress Enter for default (ollama), or type 'groq' / 'openwebui':")
 
     try:
