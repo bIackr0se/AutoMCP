@@ -67,6 +67,14 @@ Environment variables (a `.env` file next to `agent.py` is loaded automatically)
 | `GROQ_API_KEY` | required if `LLM_BACKEND=groq` | none |
 | `OTX_API_KEY` | AlienVault OTX key for counter-recon threat-intel lookups | none, feature fails closed |
 
+`ES_VERIFY_CERTS` defaults to `true`. Most Elastic Security quick-start
+installs generate a self-signed CA (typically `http_ca.crt`), so pointing
+this agent at one without setting `ES_CA_CERT` will fail every ES call
+(`execute_elastic_query` returns an error message; standby mode's
+`wait_alerts` logs "Error checking last alert" and polls forever without
+ever detecting an alert). Set `ES_CA_CERT` to that cluster's CA bundle
+rather than falling back to `ES_VERIFY_CERTS=false`.
+
 ## Development
 
 ```bash
