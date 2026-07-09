@@ -264,11 +264,10 @@ def build_analyzer_messages(query_result):
 #     response = await llm.ainvoke(build_analyzer_messages(state["messages"][-1].content))
 #     return {"messages": [AIMessage(content=response.content)]}
 #
-# >>> GATE (Sec 5.3 review gate): the autonomous standby path
-# (wait_alerts -> execute_elastic_query_S -> query_analyzer_S) must regain a
-# human-review interrupt before a summary becomes a verdict shown to the analyst,
-# mirroring the v1 CLI's "check these alerts?" gate. This is a graph-edge change;
-# test it under langgraph before deploy.
+# The Sec 5.3 review gate on the autonomous standby path is done: see
+# review_gate() / node "review_gate_S" in agent.py, wired between
+# query_analyzer_S and assistant. A rejection removes the original verdict
+# from state via RemoveMessage, it does not just append a note beside it.
 
 
 # ---------------------------------------------------------------------------

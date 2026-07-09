@@ -9,6 +9,7 @@ from typing import Any, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
+from langgraph.graph.message import RemoveMessage
 from langgraph.types import interrupt
 
 # --- security mitigations (paper Sec 5); helpers live in mitigations.py, which
@@ -284,10 +285,15 @@ mcp = FastMCP("mcp_server")
 # Initialize Elastic Client
 @asynccontextmanager
 async def get_elastic_client(state: AppState):
-    client_kwargs: dict[str, Any] = {
-        "basic_auth": (ES_USERNAME, ES_PASSWORD),
-        "verify_certs": ES_VERIFY_CERTS,
-    }
+    client_kwargs: dict[str, Any] = {"verify_certs": ES_VERIFY_CERTS}
+    # ES_API_KEY takes precedence over basic auth when set; passing both an
+    # empty basic_auth tuple AND an api_key sends garbage Basic-auth
+    # credentials that mask the real ES_API_KEY-based auth the README
+    # documents as an alternative.
+    if ES_API_KEY:
+        client_kwargs["api_key"] = ES_API_KEY
+    else:
+        client_kwargs["basic_auth"] = (ES_USERNAME, ES_PASSWORD)
     if ES_VERIFY_CERTS and ES_CA_CERT:
         client_kwargs["ca_certs"] = ES_CA_CERT
     elastic_client = await asyncio.to_thread(
@@ -489,10 +495,18 @@ async def review_gate(state: AppState):
     "assistant" with zero human review, so a poisoned verdict could sit in
     state as if vetted. Unlike assistant()'s interrupt() (which only asks
     "what's next"), this interrupt blocks WITH the verdict itself and requires
-    an explicit operator confirmation before it is kept; a rejected or
-    non-affirmative response discards it instead of letting it stand."""
+    an explicit operator confirmation before it is kept.
+
+    On rejection the original verdict message is actually removed from state
+    via RemoveMessage(id=...), not just followed by a note: AppState uses the
+    append-only add_messages reducer, so appending a "discarded" notice next
+    to the original AIMessage would leave the poisoned verdict readable by
+    every later consumer of the recent-messages window (assistant(),
+    call_llm()) regardless of the rejection. add_messages assigns every
+    message an id on merge, so by the time this node reads state["messages"],
+    last_message.id is always set."""
     last_message = state["messages"][-1]
-    verdict = last_message.content if isinstance(last_message, AIMessage) else str(last_message)
+    verdict = last_message.content  # every BaseMessage subtype exposes .content
 
     decision = interrupt({
         "review_required": True,
@@ -502,9 +516,12 @@ async def review_gate(state: AppState):
     })
 
     if str(decision).strip().lower() not in ("yes", "y", "approve", "approved", "confirm", "confirmed"):
-        return {"messages": [AIMessage(
+        messages = [AIMessage(
             content="Standby-mode verdict REJECTED by reviewer; discarded, no action taken on it."
-        )]}
+        )]
+        if last_message.id is not None:
+            messages.insert(0, RemoveMessage(id=last_message.id))
+        return {"messages": messages}
     return {"messages": [AIMessage(content=f"[Reviewed by operator]\n{verdict}")]}
 
 
@@ -658,10 +675,15 @@ def standby_mode(state: AppState):
     return {"messages": messages}
 
 
-# Suppress SSL warnings only when verification is actually disabled (ES_VERIFY_CERTS=false);
-# leaving this unconditional would mask real cert problems once verification is on.
-if not ES_VERIFY_CERTS:
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Suppress SSL warnings for run_http_scan's counter-recon fingerprinting, which
+# always connects with verify=False regardless of ES_VERIFY_CERTS (a scan
+# target's certificate validity is not the property being checked; the target
+# is fingerprinted whether or not its cert is trusted). This is intentionally
+# NOT conditioned on ES_VERIFY_CERTS: those are two different trust contexts
+# (the SIEM connection authenticates the agent with real credentials worth
+# protecting; the recon target does not) and coupling them here would either
+# mask a real ES cert problem or spam warnings for every counter-recon scan.
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- HELPER FUNCTIONS ---
 
