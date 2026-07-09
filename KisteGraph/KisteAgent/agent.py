@@ -192,8 +192,19 @@ if not os.environ.get("GROQ_API_KEY"):
     print("Warning: GROQ_API_KEY not found. Please set it as environment variable.")
 
 # ====================
-ES_HOST = "https://141.79.66.103:9200"
-# ES_HOST = "http://localhost:9200"
+# MITIGATION (finding-002): ES_HOST was hardcoded to a DHCP-dynamic campus
+# address (141.79.66.103) with verify_certs unconditionally disabled, so any
+# on-path attacker on that network could harvest SIEM credentials via MitM.
+# Both are now env-configurable, and cert verification is on by default; a
+# self-signed lab cluster should point ES_CA_CERT at its CA bundle rather than
+# disabling verification. ES_VERIFY_CERTS=false is an explicit, loud opt-out
+# for throwaway local dev only.
+ES_HOST = os.getenv("ES_HOST", "https://10.10.0.5:9200")
+ES_CA_CERT = os.getenv("ES_CA_CERT")  # path to a CA bundle for a self-signed cluster
+ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "true").strip().lower() not in ("false", "0", "no")
+if not ES_VERIFY_CERTS:
+    print("WARNING: ES_VERIFY_CERTS=false — TLS certificate verification is OFF. "
+          "SIEM credentials are exposed to on-path MitM. Local/throwaway dev only.")
 ES_ALERTS_INDEX = ".internal.alerts-security.alerts-default*" # Index for security alerts
 ES_INTEL_INDEX = "otx_pulses_minimal" # Index for threat intelligence
 ES_API_KEY = os.getenv("ES_API_KEY") # Elasticsearch API Key from environment variable
@@ -273,13 +284,18 @@ mcp = FastMCP("mcp_server")
 # Initialize Elastic Client
 @asynccontextmanager
 async def get_elastic_client(state: AppState):
+    client_kwargs: dict[str, Any] = {
+        "basic_auth": (ES_USERNAME, ES_PASSWORD),
+        "verify_certs": ES_VERIFY_CERTS,
+    }
+    if ES_VERIFY_CERTS and ES_CA_CERT:
+        client_kwargs["ca_certs"] = ES_CA_CERT
     elastic_client = await asyncio.to_thread(
         AsyncElasticsearch,
-        ES_HOST, 
-        basic_auth=(ES_USERNAME, ES_PASSWORD),
-        verify_certs=False
+        ES_HOST,
+        **client_kwargs,
     )
-    
+
     try:
         yield elastic_client
     finally:
@@ -464,11 +480,32 @@ async def query_analyzer(state: AppState):
 
     return {"messages": [AIMessage(content=response.content)]}
 
-# >>> GATE (Sec 5.3, defense-in-depth): channel separation above is the primary
-# fix; the autonomous standby path (query_analyzer_S) should also regain a
-# human-review interrupt before a summary becomes a verdict. Add an interrupt()
-# node on the _S branch in the graph builder and test under langgraph before
-# enabling (it changes the standby execution model).
+async def review_gate(state: AppState):
+    """MITIGATION M3 (Sec 5.3), defense-in-depth: human-review gate on the
+    autonomous standby path. Channel separation in query_analyzer/
+    build_analyzer_messages is the primary fix; this closes the residual gap
+    finding-003 identified, that the standby path (standby_mode -> wait_alerts
+    -> execute_elastic_query_S -> query_analyzer_S) previously reached
+    "assistant" with zero human review, so a poisoned verdict could sit in
+    state as if vetted. Unlike assistant()'s interrupt() (which only asks
+    "what's next"), this interrupt blocks WITH the verdict itself and requires
+    an explicit operator confirmation before it is kept; a rejected or
+    non-affirmative response discards it instead of letting it stand."""
+    last_message = state["messages"][-1]
+    verdict = last_message.content if isinstance(last_message, AIMessage) else str(last_message)
+
+    decision = interrupt({
+        "review_required": True,
+        "source": "standby_mode",
+        "verdict": verdict,
+        "prompt": "Standby-mode analysis ready for review. Confirm to accept (yes) or reject (no):",
+    })
+
+    if str(decision).strip().lower() not in ("yes", "y", "approve", "approved", "confirm", "confirmed"):
+        return {"messages": [AIMessage(
+            content="Standby-mode verdict REJECTED by reviewer; discarded, no action taken on it."
+        )]}
+    return {"messages": [AIMessage(content=f"[Reviewed by operator]\n{verdict}")]}
 
 
 async def generate_elastic_query(state: AppState):
@@ -621,8 +658,10 @@ def standby_mode(state: AppState):
     return {"messages": messages}
 
 
-# Suppress SSL warnings for self-signed certificates (common in reconnaissance)
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+# Suppress SSL warnings only when verification is actually disabled (ES_VERIFY_CERTS=false);
+# leaving this unconditional would mask real cert problems once verification is on.
+if not ES_VERIFY_CERTS:
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- HELPER FUNCTIONS ---
 
@@ -1093,6 +1132,7 @@ builder.add_node("execute_elastic_query_S", execute_elastic_query)
 builder.add_node("query_analyzer_C", query_analyzer)
 builder.add_node("query_analyzer_S", query_analyzer)
 builder.add_node("wait_alerts", wait_alerts)
+builder.add_node("review_gate_S", review_gate)
 
 # Add Edges
 builder.add_edge(START, "assistant")
@@ -1120,11 +1160,14 @@ builder.add_edge("generate_elastic_query", "execute_elastic_query_C")
 builder.add_edge("execute_elastic_query_C", "query_analyzer_C")
 builder.add_edge("query_analyzer_C", "assistant")
 
-# 3. Standby Flow (Wait -> Alert -> Analyze -> Return to Assistant)
+# 3. Standby Flow (Wait -> Alert -> Analyze -> Human Review -> Return to Assistant)
+# MITIGATION M3 (Sec 5.3): review_gate_S is the human-review interrupt finding-003
+# showed was missing on this path; do not remove it or route around it.
 builder.add_edge("standby_mode", "wait_alerts")
 builder.add_edge("wait_alerts", "execute_elastic_query_S")
 builder.add_edge("execute_elastic_query_S", "query_analyzer_S")
-builder.add_edge("query_analyzer_S", "assistant")
+builder.add_edge("query_analyzer_S", "review_gate_S")
+builder.add_edge("review_gate_S", "assistant")
 
 # 4. New Tool Flows (One-Shot: Return to Assistant)
 builder.add_edge("counter_recon_mode", "assistant")

@@ -6,12 +6,13 @@ Maps to the three matched mitigations in the SHIELD-AI paper, Section 5:
   - M2 / Sec 5.2  Severity-Aware Retention
   - M3 / Sec 5.3  Instruction-Data Separation with a Review Gate
 
-STATUS. M1 (including the origin-tie), M2 and M3 are complete and wired into
+STATUS. M1 (including the origin-tie), M2 and M3, including the standby-path
+review gate (review_gate_S in agent.py's graph), are complete and wired into
 agent.py. The M1 origin-tie reads the indicators of the retrieved alerts, which
 execute_elastic_query threads into AppState; counter_recon binds the scan target
-to them via validate_scan_target. Items marked >>> SCHEMA / >>> GATE still need
-the live Elasticsearch schema or a graph-edge change before they harden the
-standby path. Do NOT report a measured mitigation effect until the post-fix
+to them via validate_scan_target. Items marked >>> SCHEMA still need the live
+Elasticsearch schema re-confirmed for a new deployment (severity values, alert
+timestamp field). Do NOT report a measured mitigation effect until the post-fix
 attack rates are actually run against the deployed agent.
 
 Integration targets in agent.py (the 1004-line deployed version):
