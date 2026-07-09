@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+*.pyd
+*.pyo
+*.egg-info/
+
+# Virtual environments
+/mcp/
+.venv/
+venv/
+
+# Editors and IDEs
+.vscode/
+.idea/
+
+# OS-specific
+.DS_Store
+
+# Secrets / local env
+.env
+
+# LangGraph local dev runtime state
+.langgraph_api/
+
+# Jupyter Notebook files
+.ipynb_checkpoints/

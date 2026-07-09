@@ -9,6 +9,7 @@ from typing import Any, Optional
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph import MessagesState
 from langchain_core.messages import SystemMessage, AIMessage, HumanMessage, ToolMessage
+from langgraph.graph.message import RemoveMessage
 from langgraph.types import interrupt
 
 # --- security mitigations (paper Sec 5); helpers live in mitigations.py, which
@@ -192,8 +193,19 @@ if not os.environ.get("GROQ_API_KEY"):
     print("Warning: GROQ_API_KEY not found. Please set it as environment variable.")
 
 # ====================
-ES_HOST = "https://141.79.66.103:9200"
-# ES_HOST = "http://localhost:9200"
+# MITIGATION (finding-002): ES_HOST was hardcoded to a DHCP-dynamic campus
+# address (141.79.66.103) with verify_certs unconditionally disabled, so any
+# on-path attacker on that network could harvest SIEM credentials via MitM.
+# Both are now env-configurable, and cert verification is on by default; a
+# self-signed lab cluster should point ES_CA_CERT at its CA bundle rather than
+# disabling verification. ES_VERIFY_CERTS=false is an explicit, loud opt-out
+# for throwaway local dev only.
+ES_HOST = os.getenv("ES_HOST", "https://10.10.0.5:9200")
+ES_CA_CERT = os.getenv("ES_CA_CERT")  # path to a CA bundle for a self-signed cluster
+ES_VERIFY_CERTS = os.getenv("ES_VERIFY_CERTS", "true").strip().lower() not in ("false", "0", "no")
+if not ES_VERIFY_CERTS:
+    print("WARNING: ES_VERIFY_CERTS=false — TLS certificate verification is OFF. "
+          "SIEM credentials are exposed to on-path MitM. Local/throwaway dev only.")
 ES_ALERTS_INDEX = ".internal.alerts-security.alerts-default*" # Index for security alerts
 ES_INTEL_INDEX = "otx_pulses_minimal" # Index for threat intelligence
 ES_API_KEY = os.getenv("ES_API_KEY") # Elasticsearch API Key from environment variable
@@ -273,13 +285,23 @@ mcp = FastMCP("mcp_server")
 # Initialize Elastic Client
 @asynccontextmanager
 async def get_elastic_client(state: AppState):
+    client_kwargs: dict[str, Any] = {"verify_certs": ES_VERIFY_CERTS}
+    # ES_API_KEY takes precedence over basic auth when set; passing both an
+    # empty basic_auth tuple AND an api_key sends garbage Basic-auth
+    # credentials that mask the real ES_API_KEY-based auth the README
+    # documents as an alternative.
+    if ES_API_KEY:
+        client_kwargs["api_key"] = ES_API_KEY
+    else:
+        client_kwargs["basic_auth"] = (ES_USERNAME, ES_PASSWORD)
+    if ES_VERIFY_CERTS and ES_CA_CERT:
+        client_kwargs["ca_certs"] = ES_CA_CERT
     elastic_client = await asyncio.to_thread(
         AsyncElasticsearch,
-        ES_HOST, 
-        basic_auth=(ES_USERNAME, ES_PASSWORD),
-        verify_certs=False
+        ES_HOST,
+        **client_kwargs,
     )
-    
+
     try:
         yield elastic_client
     finally:
@@ -464,11 +486,43 @@ async def query_analyzer(state: AppState):
 
     return {"messages": [AIMessage(content=response.content)]}
 
-# >>> GATE (Sec 5.3, defense-in-depth): channel separation above is the primary
-# fix; the autonomous standby path (query_analyzer_S) should also regain a
-# human-review interrupt before a summary becomes a verdict. Add an interrupt()
-# node on the _S branch in the graph builder and test under langgraph before
-# enabling (it changes the standby execution model).
+async def review_gate(state: AppState):
+    """MITIGATION M3 (Sec 5.3), defense-in-depth: human-review gate on the
+    autonomous standby path. Channel separation in query_analyzer/
+    build_analyzer_messages is the primary fix; this closes the residual gap
+    finding-003 identified, that the standby path (standby_mode -> wait_alerts
+    -> execute_elastic_query_S -> query_analyzer_S) previously reached
+    "assistant" with zero human review, so a poisoned verdict could sit in
+    state as if vetted. Unlike assistant()'s interrupt() (which only asks
+    "what's next"), this interrupt blocks WITH the verdict itself and requires
+    an explicit operator confirmation before it is kept.
+
+    On rejection the original verdict message is actually removed from state
+    via RemoveMessage(id=...), not just followed by a note: AppState uses the
+    append-only add_messages reducer, so appending a "discarded" notice next
+    to the original AIMessage would leave the poisoned verdict readable by
+    every later consumer of the recent-messages window (assistant(),
+    call_llm()) regardless of the rejection. add_messages assigns every
+    message an id on merge, so by the time this node reads state["messages"],
+    last_message.id is always set."""
+    last_message = state["messages"][-1]
+    verdict = last_message.content  # every BaseMessage subtype exposes .content
+
+    decision = interrupt({
+        "review_required": True,
+        "source": "standby_mode",
+        "verdict": verdict,
+        "prompt": "Standby-mode analysis ready for review. Confirm to accept (yes) or reject (no):",
+    })
+
+    if str(decision).strip().lower() not in ("yes", "y", "approve", "approved", "confirm", "confirmed"):
+        messages = [AIMessage(
+            content="Standby-mode verdict REJECTED by reviewer; discarded, no action taken on it."
+        )]
+        if last_message.id is not None:
+            messages.insert(0, RemoveMessage(id=last_message.id))
+        return {"messages": messages}
+    return {"messages": [AIMessage(content=f"[Reviewed by operator]\n{verdict}")]}
 
 
 async def generate_elastic_query(state: AppState):
@@ -621,7 +675,14 @@ def standby_mode(state: AppState):
     return {"messages": messages}
 
 
-# Suppress SSL warnings for self-signed certificates (common in reconnaissance)
+# Suppress SSL warnings for run_http_scan's counter-recon fingerprinting, which
+# always connects with verify=False regardless of ES_VERIFY_CERTS (a scan
+# target's certificate validity is not the property being checked; the target
+# is fingerprinted whether or not its cert is trusted). This is intentionally
+# NOT conditioned on ES_VERIFY_CERTS: those are two different trust contexts
+# (the SIEM connection authenticates the agent with real credentials worth
+# protecting; the recon target does not) and coupling them here would either
+# mask a real ES cert problem or spam warnings for every counter-recon scan.
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # --- HELPER FUNCTIONS ---
@@ -896,10 +957,12 @@ async def counter_recon(state: AppState):
     except (ValueError, TypeError):
         host_hdr = target
 
-    API_KEY = '3c6d310486f1b6485879d2865d0b9d2f4113c8e97266f288abe8670a810e6f06'
+    otx_api_key = os.getenv("OTX_API_KEY", "")
+    if not otx_api_key:
+        print("WARNING: OTX_API_KEY not set; run_otx_scan will fail closed with no threat-intel enrichment.")
 
     results = await asyncio.gather(
-        run_otx_scan(target, API_KEY),
+        run_otx_scan(target, otx_api_key),
         run_dns_scan(target),
         run_whois_scan(target),
         run_nmap_scan(pinned),
@@ -1093,6 +1156,7 @@ builder.add_node("execute_elastic_query_S", execute_elastic_query)
 builder.add_node("query_analyzer_C", query_analyzer)
 builder.add_node("query_analyzer_S", query_analyzer)
 builder.add_node("wait_alerts", wait_alerts)
+builder.add_node("review_gate_S", review_gate)
 
 # Add Edges
 builder.add_edge(START, "assistant")
@@ -1120,11 +1184,14 @@ builder.add_edge("generate_elastic_query", "execute_elastic_query_C")
 builder.add_edge("execute_elastic_query_C", "query_analyzer_C")
 builder.add_edge("query_analyzer_C", "assistant")
 
-# 3. Standby Flow (Wait -> Alert -> Analyze -> Return to Assistant)
+# 3. Standby Flow (Wait -> Alert -> Analyze -> Human Review -> Return to Assistant)
+# MITIGATION M3 (Sec 5.3): review_gate_S is the human-review interrupt finding-003
+# showed was missing on this path; do not remove it or route around it.
 builder.add_edge("standby_mode", "wait_alerts")
 builder.add_edge("wait_alerts", "execute_elastic_query_S")
 builder.add_edge("execute_elastic_query_S", "query_analyzer_S")
-builder.add_edge("query_analyzer_S", "assistant")
+builder.add_edge("query_analyzer_S", "review_gate_S")
+builder.add_edge("review_gate_S", "assistant")
 
 # 4. New Tool Flows (One-Shot: Return to Assistant)
 builder.add_edge("counter_recon_mode", "assistant")
