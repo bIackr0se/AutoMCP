@@ -86,5 +86,12 @@ make integration_tests        # integration tests (needs live ES/LLM backends)
 
 `src/agent/` is the untouched LangGraph starter-template package (a
 single-node stub graph), kept only because `pyproject.toml`'s build config
-packages it as `kiste-agent`'s source layout. `tests/` currently exercises
-that stub, not `agent.py`; real coverage of the deployed graph is open work.
+packages it as `kiste-agent`'s source layout.
+
+`tests/unit_tests/test_configuration.py` reads `langgraph.json`, imports its
+`./agent.py:graph` target with `LLM_BACKEND=ollama`, and asserts that the
+exported graph is compiled (a `Pregel` instance). It does not start a LangGraph
+server, invoke the graph, or call Elasticsearch, LLM, MCP, or other backend
+services. `tests/integration_tests/test_graph.py` makes one smoke `ainvoke` call
+with placeholder input as part of the live-backend integration suite;
+behavioral coverage of the deployed graph remains open work.
