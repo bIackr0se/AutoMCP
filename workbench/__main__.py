@@ -23,6 +23,7 @@ def snapshot():
     for count in range(1, len(alerts) + 1):
         window = alerts[:count]
         recent = sorted(window, key=retention._alert_timestamp, reverse=True)[:3]
+        # Mirror the runtime's bounded high-severity query (size=2).
         reserve = sorted(
             (
                 a
@@ -34,7 +35,7 @@ def snapshot():
             ),
             key=retention._alert_timestamp,
             reverse=True,
-        )[:3]
+        )[:2]
         frames.append(
             {
                 "recent": retention.severity_aware_retain(recent, [], size=3),

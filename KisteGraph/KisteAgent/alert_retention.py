@@ -2,6 +2,7 @@
 
 import json
 
+# Deployment-specific lowercase values; see the SCHEMA note in mitigations.py.
 _HIGH_SEVERITIES = ["critical", "high"]
 
 

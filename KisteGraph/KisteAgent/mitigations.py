@@ -25,7 +25,6 @@ Integration targets in agent.py (the 1004-line deployed version):
   - AppState                 -> carries originating_indicators for the origin-tie
 """
 
-import json
 import ipaddress
 import socket
 
@@ -266,8 +265,7 @@ def build_analyzer_messages(query_result):
 # medium/low), and kibana.alert.workflow_status is uniformly "open" (no
 # acknowledged/closed states present), so an unresolved-status filter would be a
 # no-op and is omitted. Re-confirm against the live index for any new deployment.
-
-
+# Implementation lives in alert_retention.py and is re-exported above.
 
 # Integration in execute_elastic_query() (the `else` branch, replacing size=3):
 #   - keep the recency query (size=RETENTION_SIZE) as `recent`

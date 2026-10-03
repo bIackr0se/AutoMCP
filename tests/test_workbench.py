@@ -24,6 +24,14 @@ class RetentionTests(unittest.TestCase):
             [a["id"] for a in frames[-1]["retained"]], ["A-022", "A-021", "A-017"]
         )
 
+    def test_reserve_query_standin_is_bounded_to_two(self):
+        alerts = copy.deepcopy(snapshot()["alerts"])
+        for alert in alerts[:3]:
+            alert["kibana.alert.rule.parameters.severity"] = "high"
+        with patch("pathlib.Path.read_text", return_value=json.dumps(alerts)):
+            final = snapshot()["frames"][-1]["retained"]
+        self.assertEqual([a["id"] for a in final], ["A-022", "A-019", "A-018"])
+
     def test_content_deduplication_and_reserve_priority(self):
         old = {"id": "same", "@timestamp": "2026-06-01T08:00:00Z"}
         new = {"id": "same", "@timestamp": "2026-06-01T09:00:00Z"}

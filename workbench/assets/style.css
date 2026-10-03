@@ -280,14 +280,14 @@ a:focus-visible {
 }
 .dot {
   display: inline-block;
-  width: 8px;
-  height: 8px;
-  border: 1px solid #657b7c;
-  border-radius: 50%;
+  width: 14px;
+  height: 10px;
+  border: 1px solid var(--line);
+  border-radius: 0;
 }
 .dot.kept {
-  background: var(--blue);
-  border-color: var(--blue);
+  background: var(--pale);
+  border-color: var(--line);
 }
 .evidence {
   border-left: 1px solid var(--line);
@@ -359,12 +359,12 @@ code {
   padding: 34px 0;
   border-bottom: 1px solid var(--line);
 }
-.review p {
+.review p:not(.eyebrow) {
   font-size: 15px;
   margin: 0 0 16px;
 }
 .sample-tag {
-  font-size: 9px;
+  font-size: 10px;
   color: var(--muted);
 }
 .decision {
@@ -507,7 +507,7 @@ footer {
     padding: 12px 8px;
   }
   .step > span {
-    font-size: 8px;
+    font-size: 10px;
     letter-spacing: 0;
   }
   .step strong {
@@ -561,7 +561,7 @@ footer {
     gap: 12px;
     font-size: 10px;
   }
-  .review p {
+  .review p:not(.eyebrow) {
     font-size: 14px;
   }
   h1 {
