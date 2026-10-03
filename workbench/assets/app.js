@@ -35,7 +35,7 @@ function renderDetail() {
       retained
         ? strategy === "retained" && !contains("recent", selected)
           ? "Included from the severity reserve. Recency alone excludes this record."
-          : "Included as a recent alert in the remaining context slots."
+          : "Included as one of the most recent alerts at this replay step."
         : data.alerts.indexOf(alert) >= position
           ? "Not yet arrived at this replay step."
           : contains("recent", selected)

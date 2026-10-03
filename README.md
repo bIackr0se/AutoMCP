@@ -11,8 +11,7 @@ runtime directory.
 
 What reaches the analyst when the context window has only three places?
 Advance a fictional shift, watch an older critical record leave the recent
-window, then switch on the severity reserve. Inspect the record that takes its
-place before keeping or discarding a prewritten sample verdict.
+window, then switch on the severity reserve. Inspect the newer record that gives up its slot before keeping or discarding a prewritten sample verdict.
 
 With **Python 3.10+**, from a clone or downloaded source archive:
 

@@ -228,7 +228,7 @@ a:focus-visible {
   border-bottom: 1px solid var(--line);
   border-radius: 0;
   text-align: left;
-  padding: 13px 10px 13px 0;
+  padding: 13px 10px;
   background: transparent;
   position: relative;
   color: var(--muted);
@@ -239,7 +239,6 @@ a:focus-visible {
 }
 .alert.selected {
   box-shadow: inset 3px 0 var(--blue);
-  padding-left: 10px;
 }
 .time {
   font: 12px var(--mono);
