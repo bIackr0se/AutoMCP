@@ -1,0 +1,56 @@
+[
+  {
+    "id": "A-017",
+    "@timestamp": "2026-06-01T08:41:00Z",
+    "rule": "Unexpected controller program change",
+    "asset": "Mixer PLC / line 04",
+    "evidence": "Program checksum changed outside the fictional maintenance window.",
+    "kind": "integrity",
+    "kibana.alert.rule.parameters.severity": "critical"
+  },
+  {
+    "id": "A-018",
+    "@timestamp": "2026-06-01T08:44:00Z",
+    "rule": "Operator login from a new workstation",
+    "asset": "HMI / line 04",
+    "evidence": "A new workstation identity appeared in the synthetic login record.",
+    "kind": "identity",
+    "kibana.alert.rule.parameters.severity": "medium"
+  },
+  {
+    "id": "A-019",
+    "@timestamp": "2026-06-01T08:48:00Z",
+    "rule": "Scheduled inventory heartbeat",
+    "asset": "Engineering station / line 02",
+    "evidence": "A routine asset inventory event was marked low severity by the fixture.",
+    "kind": "inventory",
+    "kibana.alert.rule.parameters.severity": "low"
+  },
+  {
+    "id": "A-020",
+    "@timestamp": "2026-06-01T08:51:00Z",
+    "rule": "Scheduled inventory heartbeat",
+    "asset": "Engineering station / line 03",
+    "evidence": "A routine asset inventory event was marked low severity by the fixture.",
+    "kind": "inventory",
+    "kibana.alert.rule.parameters.severity": "low"
+  },
+  {
+    "id": "A-021",
+    "@timestamp": "2026-06-01T08:55:00Z",
+    "rule": "Scheduled inventory heartbeat",
+    "asset": "Engineering station / line 04",
+    "evidence": "A routine asset inventory event was marked low severity by the fixture.",
+    "kind": "inventory",
+    "kibana.alert.rule.parameters.severity": "low"
+  },
+  {
+    "id": "A-022",
+    "@timestamp": "2026-06-01T08:57:00Z",
+    "rule": "Scheduled inventory heartbeat",
+    "asset": "Engineering station / line 05",
+    "evidence": "A routine asset inventory event was marked low severity by the fixture.",
+    "kind": "inventory",
+    "kibana.alert.rule.parameters.severity": "low"
+  }
+]

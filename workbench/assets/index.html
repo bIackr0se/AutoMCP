@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>AutoMCP · Evidence workbench</title>
+    <link rel="stylesheet" href="/style.css" />
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <header>
+      <a class="brand" href="/">AutoMCP<span> / CoAnalyst</span></a
+      ><span class="local">Synthetic case · local only</span>
+    </header>
+    <main>
+      <section class="intro">
+        <div>
+          <p class="eyebrow">EVIDENCE WORKBENCH / CASE 01</p>
+          <h1>What survives<br />the alert window?</h1>
+          <p class="lead">
+            Six alerts. Three places in the analyst’s context.<br />Follow the
+            selection, then decide what to keep.
+          </p>
+        </div>
+        <aside class="case-label">
+          <p>FICTIONAL SITE</p>
+          <strong>Line 04</strong><span>Controller integrity review</span
+          ><span>01 JUN 2026 / 08:57 UTC</span>
+        </aside>
+      </section>
+      <div class="boundary">
+        A deterministic replay of alert selection. The sample verdict is
+        prewritten. No model, Elasticsearch, or external service is connected.
+      </div>
+      <div id="error" class="error" role="alert" hidden></div>
+      <div id="loading" role="status">Loading the synthetic case…</div>
+      <div id="case" hidden>
+        <section class="flow">
+          <div class="step">
+            <span>01 / RETRIEVE</span><strong id="total">6 alerts</strong
+            ><small>One fictional time window</small>
+          </div>
+          <div class="step active">
+            <span>02 / RETAIN</span><strong>3 context slots</strong
+            ><small>Compare the selection rule</small>
+          </div>
+          <div class="step">
+            <span>03 / REVIEW</span><strong>Your decision</strong
+            ><small>Keep or discard a sample verdict</small>
+          </div>
+        </section>
+        <div class="workspace">
+          <section class="selection" aria-labelledby="selection-title">
+            <div class="section-head">
+              <div>
+                <p class="eyebrow">02 / THE CONTEXT WINDOW</p>
+                <h2 id="selection-title">A change in what gets seen.</h2>
+              </div>
+              <span class="capacity"><span id="used">3</span> / 3 SLOTS</span>
+            </div>
+            <div class="switch" role="group" aria-label="Retention strategy">
+              <button id="recent" aria-pressed="true">Recency only</button
+              ><button id="reserve" aria-pressed="false">
+                Severity reserve
+              </button>
+            </div>
+            <div class="shift">
+              <button id="previous" aria-label="Previous alert">←</button
+              ><span id="position" aria-live="polite"></span
+              ><button id="next" aria-label="Advance the shift">
+                Advance the shift →
+              </button>
+            </div>
+            <p id="explanation" class="explanation" aria-live="polite"></p>
+            <div
+              id="alerts"
+              class="alerts"
+              role="group"
+              aria-label="Synthetic alert timeline"
+            ></div>
+            <div class="legend">
+              <span><i class="dot kept"></i> In context</span
+              ><span><i class="dot"></i> Outside context</span
+              ><span>Oldest → newest · UTC</span>
+            </div>
+          </section>
+          <aside class="evidence" aria-labelledby="evidence-title">
+            <p class="eyebrow">SELECT AN ALERT TO INSPECT</p>
+            <div id="detail"></div>
+            <details>
+              <summary>Raw synthetic record</summary>
+              <pre id="raw"></pre>
+            </details>
+            <p class="source-note">
+              Selection computed by the same
+              <code>severity_aware_retain</code> function used by CoAnalyst.
+              Alert severity is fixture data, not a model judgment.
+            </p>
+          </aside>
+        </div>
+        <section class="review" aria-labelledby="review-title">
+          <div>
+            <p class="eyebrow">03 / THE HUMAN DECISION</p>
+            <h2 id="review-title">A verdict is a proposal.</h2>
+            <p id="verdict"></p>
+            <span class="sample-tag"
+              >PREWRITTEN SAMPLE / NOT A MODEL RESPONSE</span
+            >
+          </div>
+          <div class="decision">
+            <p id="decision" role="status">Awaiting your review</p>
+            <div>
+              <button id="keep" class="primary">Keep sample verdict</button
+              ><button id="discard">Discard</button>
+            </div>
+            <button id="reset" class="reset">Reset case</button
+            ><small
+              >Decisions stay in this page and clear on reset or reload. Nothing
+              is sent to a provider.</small
+            >
+          </div>
+        </section>
+        <section class="reading">
+          <h2>Read the boundary.</h2>
+          <p>
+            The reserve gets inclusion priority, then recent alerts fill the
+            remaining slots. The final selection is sorted newest first. The
+            workbench does not model an Elasticsearch query, an LLM’s behavior,
+            or the operational graph’s interrupt. Its review controls illustrate
+            the decision; they do not execute it.
+          </p>
+          <p class="code-link">
+            Source: <code>KisteGraph/KisteAgent/alert_retention.py</code
+            ><br />Operational review: <code>agent.py → review_gate_S</code>
+          </p>
+        </section>
+      </div>
+    </main>
+    <footer>
+      <span>AutoMCP / CoAnalyst</span
+      ><span>Observe the record. Question the conclusion.</span>
+    </footer>
+  </body>
+</html>
