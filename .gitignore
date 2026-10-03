@@ -25,3 +25,8 @@ venv/
 
 # Jupyter Notebook files
 .ipynb_checkpoints/
+
+# Browser verification
+node_modules/
+test-results/
+playwright-report/

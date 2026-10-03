@@ -1,0 +1,12 @@
+{
+  "name": "automcp-workbench-checks",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser verification for the synthetic AutoMCP evidence workbench.",
+  "scripts": {
+    "test:browser": "playwright test"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0"
+  }
+}

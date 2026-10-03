@@ -2,11 +2,16 @@
 
 A LangGraph agent that triages Elastic Security alerts, correlates threat
 intel, and performs gated counter-reconnaissance against the source of an
-attack. Exposed both as a LangGraph graph (`agent.py:graph`) and, via the
-same file, an MCP tool server (`mcp.server.fastmcp.FastMCP`).
+attack. The configured execution entry point is the LangGraph graph (`agent.py:graph`).
+The module initializes a FastMCP instance but provides no tool registrations or
+server launcher; use the LangGraph entry point for this runtime.
 
 Background and the accepted-paper security posture are in the [repo-level
 README](../../README.md).
+
+## Try the credential-free workbench
+
+From the repository root, run `python3 -m workbench`. The [root guide](../../README.md#try-the-evidence-workbench) describes the synthetic replay and its limits.
 
 ## Modes
 
@@ -30,7 +35,8 @@ polling itself.
 This agent is the subject of a SHIELD-AI 2026 paper that found three
 vulnerabilities in its agentic layer (target selection, alert retrieval,
 summarization) and implemented one matched mitigation per vulnerability.
-All three are wired into the deployed graph, in [`mitigations.py`](mitigations.py):
+All three are wired into the deployed graph, in [`mitigations.py`](mitigations.py); retention now lives in the shared
+[`alert_retention.py`](alert_retention.py) and is re-exported for existing callers:
 
 - **M1** (`validate_scan_target`): a counter-recon target is only scanned if
   every address it resolves to falls outside a deny-list (private, loopback,
