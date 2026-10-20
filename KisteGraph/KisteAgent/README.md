@@ -22,13 +22,13 @@ The router (`assistant` node) reads the conversation and dispatches to one of:
   (`generate_elastic_query` -> `execute_elastic_query` -> `query_analyzer`).
 - **`counter_recon_mode`**: active recon (nmap, WHOIS, DNS, HTTP, OTX)
   against a validated external target.
-- **`standby_mode`**: continuous polling (`wait_alerts`) that analyzes new
+- **`standby_mode`**: bounded polling (`wait_alerts`) that analyzes new
   alerts as they land, gated by a human-review interrupt before the verdict
   is kept (see Security posture below).
 
-Every path returns to `assistant`, which blocks on `interrupt()` for the next
-operator command. There is no unattended action loop beyond the standby
-polling itself.
+Completed analysis returns to `assistant`, which blocks on `interrupt()` for
+the next operator command. Standby timeout, capacity and retrieval-error exits
+end the run without analysis or review. Start a new run to monitor again.
 
 ## Security posture
 
@@ -39,14 +39,19 @@ All three are wired into the deployed graph, in [`mitigations.py`](mitigations.p
 [`alert_retention.py`](alert_retention.py) and is re-exported for existing callers:
 
 - **M1** (`validate_scan_target`): a counter-recon target is only scanned if
-  every address it resolves to falls outside a deny-list (private, loopback,
-  link-local, cloud-metadata, protected-segment ranges, including IPv6
-  encodings of a denied IPv4) and it resolves onto the indicator of an alert
-  that actually triggered the investigation. A scan with no originating
-  alert is refused.
+  every address it resolves to is global unicast and outside the protected
+  segments, including checks on IPv4 addresses embedded in IPv6. The target
+  must match an indicator from a server-signed alert retrieval in the same
+  thread. Public graph channels do not grant scan authority. A new query
+  replaces the stored receipt, and aggregates, empty results and query errors
+  clear it; the thread owner can still restore an earlier receipt from the
+  same thread's history, which only re-authorizes indicators that thread
+  actually retrieved.
 - **M2** (`severity_aware_retain`): alert retrieval keeps a high-severity
   reserve alongside the recency window, so a critical alert cannot be
-  evicted by benign volume.
+  evicted by benign volume. Standby also reserves the exact waking document
+  (`_index` and `_id`) in the three-alert result. If that document disappears
+  or cannot be fetched, the run ends without analyzing a different window.
 - **M3** (`build_analyzer_messages`): the analyst LLM's trusted instruction
   stays in the system role; untrusted alert content goes in the user role
   inside a per-call random delimiter, so an instruction planted in alert
@@ -72,22 +77,74 @@ Environment variables (a `.env` file next to `agent.py` is loaded automatically)
 | `LLM_BACKEND` | `ollama` or `groq` | prompts if unset |
 | `GROQ_API_KEY` | required if `LLM_BACKEND=groq` | none |
 | `OTX_API_KEY` | AlienVault OTX key for counter-recon threat-intel lookups | none, feature fails closed |
+| `KISTE_API_TOKENS` | JSON map of bearer tokens to identities and optional reviewer grants, described below | unset, single-user local mode |
+| `KISTE_PROVENANCE_KEY` | 32 random bytes encoded as 64 hex characters, shared by server processes to verify retrieval receipts | random process-local key |
+| `STANDBY_TIMEOUT_SECONDS` | Maximum wait for one standby session, including Elasticsearch calls | one poll interval less than the LangGraph server's `BG_JOB_TIMEOUT_SECS` (`86400`) |
+| `STANDBY_BATCH_LIMIT` | Maximum baseline IDs retained from the latest execution batch | `100` (Kibana default rule `max_signals`) |
+| `STANDBY_POLL_SECONDS` | Delay between alert checks | `5` |
+| `STANDBY_MAX_CONCURRENT` | Per-process standby limit, clamped below `N_JOBS_PER_WORKER` to retain an ordinary worker slot | half of `N_JOBS_PER_WORKER` (default `10`) |
+
+The default deadline is counted from when standby starts. The server's
+`BG_JOB_TIMEOUT_SECS` counts the whole run, including the assistant step before
+standby. Set `STANDBY_TIMEOUT_SECONDS` lower when the steps before standby can
+take longer than one poll interval. Time settings must be finite and positive.
+A process with only one worker has no standby capacity. Standby snapshots the
+latest execution timestamp and its document IDs in one search,
+then polls for an alert at or after that timestamp excluding those IDs. Each
+poll returns the exact document to pin, sorted by timestamp and alert UUID.
+If the baseline batch exceeds `STANDBY_BATCH_LIMIT`, polling requires a strictly
+newer execution so an unseen baseline document cannot wake standby.
+
+Use one `KISTE_PROVENANCE_KEY` across processes and restarts when existing
+retrieval receipts must remain usable. Keep it in server environment settings,
+outside graph state and source control. Without it, a server restart requires
+a fresh alert retrieval before counter-recon can run.
 
 `ES_VERIFY_CERTS` defaults to `true`. Most Elastic Security quick-start
 installs generate a self-signed CA (typically `http_ca.crt`), so pointing
 this agent at one without setting `ES_CA_CERT` will fail every ES call
-(`execute_elastic_query` returns an error message; standby mode's
-`wait_alerts` logs "Error checking last alert" and polls forever without
-ever detecting an alert). Set `ES_CA_CERT` to that cluster's CA bundle
+(`execute_elastic_query` returns an error message; standby ends with an error).
+Set `ES_CA_CERT` to that cluster's CA bundle
 rather than falling back to `ES_VERIFY_CERTS=false`.
+
+### API access and review ownership
+
+With `KISTE_API_TOKENS` unset, `uv run langgraph dev` and Studio keep the
+single-user local behavior: requests need no token and share access to threads.
+Bind this mode to loopback for use by one local operator.
+
+Set `KISTE_API_TOKENS` before starting the server to enable identity checks:
+
+```text
+KISTE_API_TOKENS={"<owner-secret>":{"identity":"operator-a"},"<peer-secret>":{"identity":"operator-b"},"<review-secret>":{"identity":"reviewer","reviewer":true}}
+```
+
+Replace each placeholder with a separate random secret. Clients send
+`Authorization: Bearer <secret>`, including Studio's custom auth headers when
+token mode is enabled. An empty or malformed token map refuses access.
+
+The server stamps thread ownership from the token identity. Owners can read,
+update, delete, run and resume their own threads, including ordinary menu
+interrupts and their own reviews. An explicit reviewer can read threads and
+resume another owner's pending `review_gate_S` interrupt. That resume is bound
+to the checked review checkpoint. Review permission does not permit foreign
+menu resumes, new runs or state changes. Unhandled API operations are denied
+in token mode. Studio has no separate authentication bypass.
+Create new threads after enabling token mode; earlier shared threads have no
+authenticated owner.
+
+The reviewer check uses the installed LangGraph in-memory runtime's state
+reader. This policy supports the documented `langgraph dev` runtime; changes
+to that runtime must pass the endpoint tests below.
 
 ## Development
 
 ```bash
 uv sync                       # install from the lockfile
 uv run langgraph dev          # serve the graph locally (LangGraph Studio)
-make test                     # unit tests
+make test                     # unit and security regression tests
 make integration_tests        # integration tests (needs live ES/LLM backends)
+LLM_BACKEND=ollama LANGSMITH_TEST_TRACKING=false uv run python -m pytest tests/
 ```
 
 `src/agent/` is the untouched LangGraph starter-template package (a
@@ -98,6 +155,8 @@ packages it as `kiste-agent`'s source layout.
 `./agent.py:graph` target with `LLM_BACKEND=ollama`, and asserts that the
 exported graph is compiled (a `Pregel` instance). It does not start a LangGraph
 server, invoke the graph, or call Elasticsearch, LLM, MCP, or other backend
-services. `tests/integration_tests/test_graph.py` makes one smoke `ainvoke` call
-with placeholder input as part of the live-backend integration suite;
-behavioral coverage of the deployed graph remains open work.
+services. `tests/security/` covers target validation, forged graph state,
+compiled standby routing, bounded retrieval and the configured development
+API. API tests run a loopback server and a deterministic local model responder;
+Elasticsearch and scanner calls are controlled test doubles. Disable LangSmith
+test tracking as shown above to run without uploading test results.

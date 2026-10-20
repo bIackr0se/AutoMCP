@@ -4,6 +4,10 @@
   "graphs": {
     "kiste_agent": "./agent.py:graph"
   },
+  "auth": {
+    "path": "./auth.py:auth",
+    "disable_studio_auth": true
+  },
   "env": ".env",
   "image_distro": "wolfi"
 }

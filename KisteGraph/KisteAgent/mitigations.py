@@ -8,9 +8,9 @@ Maps to the three matched mitigations in the SHIELD-AI paper, Section 5:
 
 STATUS. M1 (including the origin-tie), M2 and M3, including the standby-path
 review gate (review_gate_S in agent.py's graph), are complete and wired into
-agent.py. The M1 origin-tie reads the indicators of the retrieved alerts, which
-execute_elastic_query threads into AppState; counter_recon binds the scan target
-to them via validate_scan_target. Items marked >>> SCHEMA still need the live
+agent.py. The M1 origin-tie verifies a server-signed retrieval receipt bound to
+the current thread; counter_recon passes its indicators to validate_scan_target.
+Unsigned AppState fields grant no scan authority. Items marked >>> SCHEMA still need the live
 Elasticsearch schema re-confirmed for a new deployment (severity values, alert
 timestamp field). Do NOT report a measured mitigation effect until the post-fix
 attack rates are actually run against the deployed agent.
@@ -20,9 +20,8 @@ Integration targets in agent.py (the 1004-line deployed version):
   - counter_recon()          -> gate the target with validate_scan_target() (M1)
   - execute_elastic_query()  -> replace the size=3 branch with severity-aware
                                 retention via severity_aware_retain() (M2), and
-                                emit extract_indicators_from_alerts() into state
-                                so the M1 origin-tie has the originating alert
-  - AppState                 -> carries originating_indicators for the origin-tie
+                                sign the extracted indicators for the M1 origin-tie
+  - AppState                 -> carries the thread-bound originating_provenance receipt
 """
 
 import ipaddress
@@ -43,7 +42,6 @@ except ImportError:
 # Ranges a scan target must NOT resolve into. OT_SEGMENTS reflects this testbed;
 # set it to the deployment's actual protected ranges.
 _OT_SEGMENTS = [ipaddress.ip_network("10.10.0.0/24")]
-_CLOUD_METADATA = {ipaddress.ip_address("169.254.169.254")}
 _NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
@@ -68,7 +66,7 @@ def _embedded_ipv4(ip):
 
 
 def _is_denied(ip):
-    """True if an address falls in any denied range (private / loopback /
+    """Return whether an address is non-global, multicast or in a denied range (private / loopback /
     link-local / cloud-metadata / OT segment), accounting for IPv6 encodings that
     embed a denied IPv4."""
     candidates = [ip]
@@ -76,7 +74,9 @@ def _is_denied(ip):
     if emb is not None:
         candidates.append(emb)
     for c in candidates:
-        if c.is_private or c.is_loopback or c.is_link_local or c in _CLOUD_METADATA:
+        # is_global excludes private, loopback, link-local and cloud metadata.
+        # Multicast and deployment OT segments can be global, so check both.
+        if not c.is_global or c.is_multicast:
             return True
         if any(c in net for net in _OT_SEGMENTS):
             return True
@@ -127,8 +127,9 @@ def validate_scan_target(target, originating_indicators):
     outside the deny-list (private / loopback / link-local / cloud-metadata /
     OT segment, incl. IPv6 encodings of denied v4) AND the target resolves onto
     the indicator of an alert that triggered the investigation (the origin-tie).
-    `originating_indicators` are IP addresses threaded from the most recent alert
-    retrieval (see _extract_originating_indicator in agent.py); a single string
+    `originating_indicators` are IP addresses from a verified, thread-bound
+    retrieval receipt (see _extract_originating_indicator in agent.py), never
+    from a client-writable state channel; a single string
     is also accepted.
 
     Returns (allowed: bool, reason: str, validated_ip). validated_ip is the
@@ -198,12 +199,12 @@ def extract_indicators_from_alerts(alerts):
 
 # Integration in counter_recon(): the free-text IPv4 fallback is removed; the
 # target comes only from the typed router argument and is gated with
-#     originating_indicators = _extract_originating_indicator(state)
+#     originating_indicators = _extract_originating_indicator(state, config)
 #     allowed, reason = validate_scan_target(target, originating_indicators)
 #     if not allowed:
 #         return {"messages": messages + [AIMessage(content=f"Scan refused: {reason}.")]}
-# where _extract_originating_indicator reads the originating_indicators that
-# execute_elastic_query wrote into AppState from the retrieved alerts.
+# where _extract_originating_indicator verifies the thread-bound receipt that
+# execute_elastic_query signed after retrieving the alerts.
 
 
 # ---------------------------------------------------------------------------
