@@ -127,8 +127,9 @@ def validate_scan_target(target, originating_indicators):
     outside the deny-list (private / loopback / link-local / cloud-metadata /
     OT segment, incl. IPv6 encodings of denied v4) AND the target resolves onto
     the indicator of an alert that triggered the investigation (the origin-tie).
-    `originating_indicators` are IP addresses threaded from the most recent alert
-    retrieval (see _extract_originating_indicator in agent.py); a single string
+    `originating_indicators` are IP addresses from a verified, thread-bound
+    retrieval receipt (see _extract_originating_indicator in agent.py), never
+    from a client-writable state channel; a single string
     is also accepted.
 
     Returns (allowed: bool, reason: str, validated_ip). validated_ip is the

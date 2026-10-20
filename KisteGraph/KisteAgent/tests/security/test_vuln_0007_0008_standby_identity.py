@@ -323,7 +323,11 @@ async def test_error_exits_clear_all_retrieval_state(agent, elastic, exit_path):
         result = await agent.wait_alerts(state, config)
     else:
         result = await agent.execute_elastic_query(state, config)
-    assert result["originating_provenance"] is None
+    if exit_path == "poll":
+        # A standby stop leaves an earlier retrieval's scan receipt in place.
+        assert "originating_provenance" not in result
+    else:
+        assert result["originating_provenance"] is None
     assert result["standby_provenance"] is None
     assert result["standby_status"] == (
         "error" if exit_path == "poll" else "retrieval_error"

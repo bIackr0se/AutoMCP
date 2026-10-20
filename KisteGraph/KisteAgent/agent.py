@@ -319,13 +319,14 @@ def project_hit(hit):
     return {**hit["_source"], "_id": hit["_id"], "_index": hit["_index"]}
 
 
+def reset_standby_state(status=None):
+    """Clear standby evidence; an earlier retrieval keeps its scan receipt."""
+    return {"standby_provenance": None, "standby_status": status}
+
+
 def reset_retrieval_state(status=None):
-    """Clear retrieval authority and standby evidence on every exit."""
-    return {
-        "originating_provenance": None,
-        "standby_provenance": None,
-        "standby_status": status,
-    }
+    """Clear retrieval authority and standby evidence on every retrieval exit."""
+    return {"originating_provenance": None, **reset_standby_state(status)}
 
 
 async def execute_elastic_query(state: AppState, config: RunnableConfig, index: str = ES_ALERTS_INDEX, standby_alert=None) -> dict[str, Any] | None:
@@ -1148,9 +1149,10 @@ if STANDBY_BATCH_LIMIT <= 0:
 STANDBY_POLL_SECONDS = _positive_seconds("STANDBY_POLL_SECONDS", "5")
 # Default: end one poll before the LangGraph server's own background-run
 # timeout, so standby returns a timeout status instead of being killed.
+_bg_job_timeout = _positive_seconds("BG_JOB_TIMEOUT_SECS", "86400")
 STANDBY_TIMEOUT_SECONDS = _positive_seconds(
     "STANDBY_TIMEOUT_SECONDS",
-    str(_positive_seconds("BG_JOB_TIMEOUT_SECS", "86400") - STANDBY_POLL_SECONDS),
+    str(_bg_job_timeout - min(STANDBY_POLL_SECONDS, _bg_job_timeout / 2)),
 )
 _worker_slots = int(os.getenv("N_JOBS_PER_WORKER", "10"))
 STANDBY_MAX_CONCURRENT = min(int(os.getenv("STANDBY_MAX_CONCURRENT", str(_worker_slots // 2))), max(0, _worker_slots - 1))
@@ -1165,7 +1167,7 @@ async def wait_alerts(state: AppState, config: RunnableConfig):
     global _standby_active
 
     def stopped(status, detail):
-        return {**reset_retrieval_state(status), "messages": [AIMessage(content=detail)]}
+        return {**reset_standby_state(status), "messages": [AIMessage(content=detail)]}
 
     with _standby_lock:
         if _standby_active >= STANDBY_MAX_CONCURRENT:
@@ -1178,14 +1180,16 @@ async def wait_alerts(state: AppState, config: RunnableConfig):
             await asyncio.sleep(STANDBY_POLL_SECONDS)
             current = await last_alert(state, baseline=baseline)
             if current:
-                return {**reset_retrieval_state("alert"), "messages": [SystemMessage(content="new_alerts"), AIMessage(content="{}")], "standby_provenance": seal("standby", current, config)}
+                return {**reset_standby_state("alert"), "messages": [SystemMessage(content="new_alerts"), AIMessage(content="{}")], "standby_provenance": seal("standby", current, config)}
 
     try:
         return await asyncio.wait_for(poll(), timeout=STANDBY_TIMEOUT_SECONDS)
     except asyncio.TimeoutError:
         return stopped("timeout", "Standby stopped: no new alert before the monitoring deadline.")
     except Exception as e:
-        return stopped("error", f"Standby stopped: {e}")
+        # Elasticsearch errors can carry node URLs; keep them in the server log.
+        print(f"Standby stopped on error: {e!r}")
+        return stopped("error", "Standby stopped: alert polling failed. See the server log.")
     finally:
         with _standby_lock:
             _standby_active -= 1

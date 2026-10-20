@@ -41,7 +41,7 @@ async def test_timeout_terminates_compiled_graph(elastic, compile_resume, limits
         "Timeout reached analysis/review or the menu"
     )
     assert result["standby_provenance"] is None
-    assert result["originating_provenance"] is None
+    assert result["originating_provenance"] == "old", "A standby stop must keep an earlier scan receipt"
 
 
 async def test_capacity_exit_terminates_compiled_graph(
@@ -73,7 +73,7 @@ async def test_capacity_exit_terminates_compiled_graph(
         )
         assert second.result()["standby_status"] == "capacity"
         assert second.result()["standby_provenance"] is None
-        assert second.result()["originating_provenance"] is None
+        assert second.result()["originating_provenance"] == "old", "A standby stop must keep an earlier scan receipt"
         assert (await graph.aget_state(config)).next == ()
         assert not second.result().get("__interrupt__")
     finally:
