@@ -8,9 +8,9 @@ Maps to the three matched mitigations in the SHIELD-AI paper, Section 5:
 
 STATUS. M1 (including the origin-tie), M2 and M3, including the standby-path
 review gate (review_gate_S in agent.py's graph), are complete and wired into
-agent.py. The M1 origin-tie reads the indicators of the retrieved alerts, which
-execute_elastic_query threads into AppState; counter_recon binds the scan target
-to them via validate_scan_target. Items marked >>> SCHEMA still need the live
+agent.py. The M1 origin-tie verifies a server-signed retrieval receipt bound to
+the current thread; counter_recon passes its indicators to validate_scan_target.
+Unsigned AppState fields grant no scan authority. Items marked >>> SCHEMA still need the live
 Elasticsearch schema re-confirmed for a new deployment (severity values, alert
 timestamp field). Do NOT report a measured mitigation effect until the post-fix
 attack rates are actually run against the deployed agent.
@@ -68,7 +68,7 @@ def _embedded_ipv4(ip):
 
 
 def _is_denied(ip):
-    """True if an address falls in any denied range (private / loopback /
+    """Return whether an address is non-global, multicast or in a denied range (private / loopback /
     link-local / cloud-metadata / OT segment), accounting for IPv6 encodings that
     embed a denied IPv4."""
     candidates = [ip]
@@ -76,7 +76,7 @@ def _is_denied(ip):
     if emb is not None:
         candidates.append(emb)
     for c in candidates:
-        if c.is_private or c.is_loopback or c.is_link_local or c in _CLOUD_METADATA:
+        if not c.is_global or c.is_multicast or c.is_private or c.is_loopback or c.is_link_local or c in _CLOUD_METADATA:
             return True
         if any(c in net for net in _OT_SEGMENTS):
             return True
@@ -198,12 +198,12 @@ def extract_indicators_from_alerts(alerts):
 
 # Integration in counter_recon(): the free-text IPv4 fallback is removed; the
 # target comes only from the typed router argument and is gated with
-#     originating_indicators = _extract_originating_indicator(state)
+#     originating_indicators = _extract_originating_indicator(state, config)
 #     allowed, reason = validate_scan_target(target, originating_indicators)
 #     if not allowed:
 #         return {"messages": messages + [AIMessage(content=f"Scan refused: {reason}.")]}
-# where _extract_originating_indicator reads the originating_indicators that
-# execute_elastic_query wrote into AppState from the retrieved alerts.
+# where _extract_originating_indicator verifies the thread-bound receipt that
+# execute_elastic_query signed after retrieving the alerts.
 
 
 # ---------------------------------------------------------------------------
