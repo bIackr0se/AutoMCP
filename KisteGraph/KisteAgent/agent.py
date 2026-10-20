@@ -25,6 +25,7 @@ try:
         extract_indicators_from_alerts,  # M1 (Sec 5.1) origin-tie: indicators of retrieved alerts
         build_analyzer_messages,         # M3 (Sec 5.3) instruction-data separation
         severity_aware_retain,           # M2 (Sec 5.2) severity-aware retention merge
+        _dig,
         _HIGH_SEVERITIES,                # M2 reserve-query severity values (verified lowercase on live index)
     )
 except ImportError:
@@ -34,12 +35,13 @@ except ImportError:
         extract_indicators_from_alerts,
         build_analyzer_messages,
         severity_aware_retain,
+        _dig,
         _HIGH_SEVERITIES,
     )
 from datetime import datetime, timezone, timedelta
 from pydantic import BaseModel, Field, field_validator, ValidationError
 from mcp.server.fastmcp import FastMCP
-from elasticsearch import AsyncElasticsearch
+from elasticsearch import AsyncElasticsearch, NotFoundError
 from contextlib import asynccontextmanager
 from langchain_ollama import ChatOllama
 from langchain_groq import ChatGroq
@@ -275,11 +277,8 @@ class QueryAlertParams(BaseModel):
 class AppState(MessagesState):
     # Optional dictionary to store structured attack analysis data
     attack_analysis: Optional[dict]
-    # Display-only indicators. Clients can update every channel, so scan
-    # authority comes from the signed, thread-bound retrieval receipt below.
-    originating_indicators: Optional[list[str]]
+    # Scan authority comes from the signed, thread-bound retrieval receipt.
     originating_provenance: str | None
-    pending_standby_alert: dict | None
     standby_provenance: str | None
     standby_status: str | None
 
@@ -315,6 +314,20 @@ async def get_elastic_client(state: AppState):
 
 # ====================
 
+def project_hit(hit):
+    """Keep the Elasticsearch document identity alongside its source fields."""
+    return {**hit["_source"], "_id": hit["_id"], "_index": hit["_index"]}
+
+
+def reset_retrieval_state(status=None):
+    """Clear retrieval authority and standby evidence on every exit."""
+    return {
+        "originating_provenance": None,
+        "standby_provenance": None,
+        "standby_status": status,
+    }
+
+
 async def execute_elastic_query(state: AppState, config: RunnableConfig, index: str = ES_ALERTS_INDEX, standby_alert=None) -> dict[str, Any] | None:
 
     # Retrieve parameters from State (from the last LLM message)
@@ -327,7 +340,7 @@ async def execute_elastic_query(state: AppState, config: RunnableConfig, index: 
         
     except (json.JSONDecodeError, ValidationError):
         # Return error if parameters cannot be parsed
-        return {"messages": [AIMessage(content="Error: Could not parse query parameters.")], "originating_indicators": [], "originating_provenance": None, "standby_status": "retrieval_error"}
+        return {**reset_retrieval_state("retrieval_error"), "messages": [AIMessage(content="Error: Could not parse query parameters.")]}
 
     DESIRED_OUTPUT_FIELDS = [
         "kibana.alert.rule.execution.timestamp",
@@ -338,7 +351,7 @@ async def execute_elastic_query(state: AppState, config: RunnableConfig, index: 
         "host.ip",
         # M1 (Sec 5.1): surface source.ip so the origin-tie has an indicator to
         # bind a scan target to (read by extract_indicators_from_alerts below into
-        # originating_indicators). Safe under M1: validate_scan_target refuses any
+        # the signed retrieval receipt). Safe under M1: validate_scan_target refuses any
         # target resolving into the OT/private/loopback/link-local/cloud-metadata
         # deny-list, and any target not matching a surfaced indicator, so exposing
         # the true source address restores analyst recon utility WITHOUT enabling
@@ -408,27 +421,20 @@ async def execute_elastic_query(state: AppState, config: RunnableConfig, index: 
     reserve_hits = []
     pinned_alerts = []
 
-    def project_hit(hit):
-        return {**hit["_source"], "_id": hit.get("_id"), "_index": hit.get("_index")}
-
     async with get_elastic_client(state) as client:
         try:
             if standby_alert:
-                pinned_response = await client.search(index=index, body={
-                    "query": {"bool": {"filter": [
-                        {"ids": {"values": [standby_alert["_id"]]}},
-                        {"term": {"_index": standby_alert["_index"]}},
-                    ]}},
-                    "size": 1,
-                    "_source": DESIRED_OUTPUT_FIELDS,
-                })
-                pinned_alerts = [project_hit(h) for h in pinned_response.get("hits", {}).get("hits", [])
-                                 if h.get("_source") and h.get("_id") == standby_alert["_id"] and h.get("_index") == standby_alert["_index"]]
-                if not pinned_alerts:
-                    raise ValueError("the alert that woke standby is no longer available")
+                try:
+                    pinned_response = await client.get(
+                        index=standby_alert["_index"], id=standby_alert["_id"],
+                        _source_includes=DESIRED_OUTPUT_FIELDS,
+                    )
+                except NotFoundError as exc:
+                    raise ValueError("the alert that woke standby is no longer available") from exc
+                pinned_alerts = [project_hit(pinned_response)]
             response = await client.search(index=index, body=query)
         except Exception as e:
-            return {"messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")], "originating_indicators": [], "originating_provenance": None, "standby_status": "retrieval_error", "pending_standby_alert": None, "standby_provenance": None}
+            return {**reset_retrieval_state("retrieval_error"), "messages": [AIMessage(content=f"Error querying Elasticsearch: {str(e)}")]}
         # MITIGATION M2 (Sec 5.2): one bounded reserve query for high-severity
         # alerts, merged below so a critical alert is not displaced by benign
         # volume in the DEFAULT recency view. It runs ONLY when the user did not
@@ -484,6 +490,7 @@ async def execute_elastic_query(state: AppState, config: RunnableConfig, index: 
     }
 
     result = {
+        **reset_retrieval_state("retrieved" if standby_alert else None),
         "messages": [
             AIMessage(
                 content= "Elastic Query Result:\n" + json.dumps(structured_response, indent=2, default=str)
@@ -491,10 +498,7 @@ async def execute_elastic_query(state: AppState, config: RunnableConfig, index: 
         ]
     }
     # Replace stored provenance on each query, including aggregates and errors.
-    result["originating_indicators"] = alert_indicators or []
     result["originating_provenance"] = seal("origin", alert_indicators, config) if alert_indicators else None
-    if standby_alert:
-        result.update(standby_status="retrieved", pending_standby_alert=None, standby_provenance=None)
     return result
 
 
@@ -502,7 +506,7 @@ async def execute_standby_query(state: AppState, config: RunnableConfig):
     """Retrieve the authenticated waking document before analyzing the window."""
     alert = unseal("standby", state.get("standby_provenance"), config)
     if not isinstance(alert, dict) or not alert.get("_id") or not alert.get("_index"):
-        return {"messages": [AIMessage(content="Standby stopped: no verified waking alert.")], "standby_status": "retrieval_error", "pending_standby_alert": None, "standby_provenance": None, "originating_indicators": [], "originating_provenance": None}
+        return {**reset_retrieval_state("retrieval_error"), "messages": [AIMessage(content="Standby stopped: no verified waking alert.")]}
     return await execute_elastic_query(state, config, standby_alert=alert)
 
 async def query_analyzer(state: AppState):
@@ -1081,30 +1085,51 @@ async def call_llm(state: AppState):
 
 # ====================
 
-async def last_alert(state: AppState, alert_index: str= ES_ALERTS_INDEX):
-    """Returns the latest alert using the shared client configuration"""
+_EXECUTION_TIMESTAMP = "kibana.alert.rule.execution.timestamp"
+_ALERT_SORT = [{_EXECUTION_TIMESTAMP: "desc"}, {"kibana.alert.uuid": {"order": "desc", "unmapped_type": "keyword"}}]
+_ALERT_FIELDS = [_EXECUTION_TIMESTAMP, "kibana.alert.rule.name", "kibana.alert.uuid"]
 
-    latest_alert_query = {
-        "size": 1,
-        "sort": [{"kibana.alert.rule.execution.timestamp": "desc"}, {"kibana.alert.uuid": {"order": "desc", "unmapped_type": "keyword"}}],
-        "_source": ["kibana.alert.rule.execution.timestamp", "kibana.alert.rule.name", "kibana.alert.uuid"],
-        "aggs": {"latest_execution_batch": {"terms": {"field": "kibana.alert.rule.execution.timestamp", "size": 1, "order": {"_key": "desc"}}}},
-    }
 
+async def last_alert(state: AppState, alert_index: str = ES_ALERTS_INDEX, baseline=None):
+    """Return the newest document outside the fixed standby baseline."""
+    query = {"size": 1, "sort": _ALERT_SORT, "_source": _ALERT_FIELDS}
+    if baseline and baseline["timestamp"] is not None:
+        bound = "gt" if baseline["truncated"] else "gte"
+        query["query"] = {"bool": {
+            "filter": [{"range": {_EXECUTION_TIMESTAMP: {bound: baseline["timestamp"]}}}],
+            "must_not": [{"ids": {"values": baseline["ids"]}}],
+        }}
     try:
         async with get_elastic_client(state) as client:
-            last_data = await client.search(index=alert_index, body=latest_alert_query)
-            last_hits = last_data.get('hits', {}).get('hits', [])
-
-            if not last_hits:
-                return None
-            
-            hit = last_hits[0]
-            buckets = last_data.get("aggregations", {}).get("latest_execution_batch", {}).get("buckets", [])
-            return {"_id": hit.get("_id"), "_index": hit.get("_index"), "_source": hit.get("_source", {}), "batch_size": buckets[0]["doc_count"] if buckets else 1}
-    
+            data = await client.search(index=alert_index, body=query)
+        hits = data.get("hits", {}).get("hits", [])
+        return project_hit(hits[0]) if hits else None
     except Exception as e:
         raise RuntimeError(f"Error checking last alert: {e}") from e
+
+
+async def standby_baseline(state: AppState):
+    """Snapshot IDs at the latest execution, with exact truncation detection."""
+    latest = await last_alert(state)
+    if latest is None:
+        return {"timestamp": None, "ids": [], "truncated": False}
+    timestamp = _dig(latest, "kibana", "alert", "rule", "execution", "timestamp")
+    if timestamp is None:
+        raise ValueError("latest alert has no execution timestamp")
+    async with get_elastic_client(state) as client:
+        data = await client.search(index=ES_ALERTS_INDEX, body={
+            "query": {"term": {_EXECUTION_TIMESTAMP: timestamp}},
+            "size": STANDBY_BATCH_LIMIT, "sort": _ALERT_SORT,
+            "_source": False, "track_total_hits": True,
+        })
+    hits = data["hits"]["hits"]
+    total = data["hits"]["total"]
+    return {
+        "timestamp": timestamp,
+        "ids": sorted({hit["_id"] for hit in hits}),
+        "truncated": total["relation"] != "eq" or total["value"] > len(hits),
+    }
+
 
 def _positive_seconds(name, default):
     value = float(os.getenv(name, default))
@@ -1112,6 +1137,12 @@ def _positive_seconds(name, default):
         raise ValueError(f"{name} must be a finite positive number")
     return value
 
+
+# Kibana's default rule max_signals is 100 (Max alerts per run):
+# https://www.elastic.co/docs/solutions/security/detect-and-alert/common-rule-settings
+STANDBY_BATCH_LIMIT = int(os.getenv("STANDBY_BATCH_LIMIT", "100"))
+if STANDBY_BATCH_LIMIT <= 0:
+    raise ValueError("STANDBY_BATCH_LIMIT must be positive")
 
 # Bound each monitoring session and leave worker slots for ordinary requests.
 STANDBY_POLL_SECONDS = _positive_seconds("STANDBY_POLL_SECONDS", "5")
@@ -1134,7 +1165,7 @@ async def wait_alerts(state: AppState, config: RunnableConfig):
     global _standby_active
 
     def stopped(status, detail):
-        return {"messages": [AIMessage(content=detail)], "standby_status": status, "pending_standby_alert": None, "standby_provenance": None}
+        return {**reset_retrieval_state(status), "messages": [AIMessage(content=detail)]}
 
     with _standby_lock:
         if _standby_active >= STANDBY_MAX_CONCURRENT:
@@ -1142,13 +1173,12 @@ async def wait_alerts(state: AppState, config: RunnableConfig):
         _standby_active += 1
 
     async def poll():
-        previous = await last_alert(state)
+        baseline = await standby_baseline(state)
         while True:
             await asyncio.sleep(STANDBY_POLL_SECONDS)
-            current = await last_alert(state)
-            if current and current != previous:
-                return {"messages": [SystemMessage(content="new_alerts"), AIMessage(content="{}")], "standby_status": "alert", "pending_standby_alert": current, "standby_provenance": seal("standby", current, config)}
-            previous = current
+            current = await last_alert(state, baseline=baseline)
+            if current:
+                return {**reset_retrieval_state("alert"), "messages": [SystemMessage(content="new_alerts"), AIMessage(content="{}")], "standby_provenance": seal("standby", current, config)}
 
     try:
         return await asyncio.wait_for(poll(), timeout=STANDBY_TIMEOUT_SECONDS)

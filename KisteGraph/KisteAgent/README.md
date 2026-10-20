@@ -42,9 +42,11 @@ All three are wired into the deployed graph, in [`mitigations.py`](mitigations.p
   every address it resolves to is global unicast and outside the protected
   segments, including checks on IPv4 addresses embedded in IPv6. The target
   must match an indicator from a server-signed alert retrieval in the same
-  thread. Public graph channels, including `originating_indicators`, do not
-  grant scan authority. A new query replaces the stored receipt; aggregates,
-  empty results and query errors clear it.
+  thread. Public graph channels do not grant scan authority. A new query
+  replaces the stored receipt, and aggregates, empty results and query errors
+  clear it; the thread owner can still restore an earlier receipt from the
+  same thread's history, which only re-authorizes indicators that thread
+  actually retrieved.
 - **M2** (`severity_aware_retain`): alert retrieval keeps a high-severity
   reserve alongside the recency window, so a critical alert cannot be
   evicted by benign volume. Standby also reserves the exact waking document
@@ -78,14 +80,18 @@ Environment variables (a `.env` file next to `agent.py` is loaded automatically)
 | `KISTE_API_TOKENS` | JSON map of bearer tokens to identities and optional reviewer grants, described below | unset, single-user local mode |
 | `KISTE_PROVENANCE_KEY` | 32 random bytes encoded as 64 hex characters, shared by server processes to verify retrieval receipts | random process-local key |
 | `STANDBY_TIMEOUT_SECONDS` | Maximum wait for one standby session, including Elasticsearch calls | one poll interval less than the LangGraph server's `BG_JOB_TIMEOUT_SECS` (`86400`) |
+| `STANDBY_BATCH_LIMIT` | Maximum baseline IDs retained from the latest execution batch | `100` (Kibana default rule `max_signals`) |
 | `STANDBY_POLL_SECONDS` | Delay between alert checks | `5` |
 | `STANDBY_MAX_CONCURRENT` | Per-process standby limit, clamped below `N_JOBS_PER_WORKER` to retain an ordinary worker slot | half of `N_JOBS_PER_WORKER` (default `10`) |
 
 By default standby ends just before the server would stop the run itself, so it
 returns a timeout status. Time settings must be finite and positive.
-A process with only one worker has no standby capacity. Polling compares
-document identity, with a stable alert-UUID sort and latest-execution batch
-count to detect insertions in the same rule execution.
+A process with only one worker has no standby capacity. Standby snapshots the
+latest execution timestamp and its document IDs once,
+then polls for an alert at or after that timestamp excluding those IDs. Each
+poll returns the exact document to pin, sorted by timestamp and alert UUID.
+If the baseline batch exceeds `STANDBY_BATCH_LIMIT`, polling requires a strictly
+newer execution so an unseen baseline document cannot wake standby.
 
 Use one `KISTE_PROVENANCE_KEY` across processes and restarts when existing
 retrieval receipts must remain usable. Keep it in server environment settings,

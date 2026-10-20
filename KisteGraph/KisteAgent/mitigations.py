@@ -20,9 +20,8 @@ Integration targets in agent.py (the 1004-line deployed version):
   - counter_recon()          -> gate the target with validate_scan_target() (M1)
   - execute_elastic_query()  -> replace the size=3 branch with severity-aware
                                 retention via severity_aware_retain() (M2), and
-                                emit extract_indicators_from_alerts() into state
-                                so the M1 origin-tie has the originating alert
-  - AppState                 -> carries originating_indicators for the origin-tie
+                                sign the extracted indicators for the M1 origin-tie
+  - AppState                 -> carries the thread-bound originating_provenance receipt
 """
 
 import ipaddress
@@ -43,7 +42,6 @@ except ImportError:
 # Ranges a scan target must NOT resolve into. OT_SEGMENTS reflects this testbed;
 # set it to the deployment's actual protected ranges.
 _OT_SEGMENTS = [ipaddress.ip_network("10.10.0.0/24")]
-_CLOUD_METADATA = {ipaddress.ip_address("169.254.169.254")}
 _NAT64_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 
 
@@ -76,7 +74,9 @@ def _is_denied(ip):
     if emb is not None:
         candidates.append(emb)
     for c in candidates:
-        if not c.is_global or c.is_multicast or c.is_private or c.is_loopback or c.is_link_local or c in _CLOUD_METADATA:
+        # is_global excludes private, loopback, link-local and cloud metadata.
+        # Multicast and deployment OT segments can be global, so check both.
+        if not c.is_global or c.is_multicast:
             return True
         if any(c in net for net in _OT_SEGMENTS):
             return True

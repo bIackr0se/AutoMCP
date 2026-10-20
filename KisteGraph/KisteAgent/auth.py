@@ -3,6 +3,7 @@
 import hmac
 import json
 import os
+from functools import cache
 from typing import Any, cast
 
 from langgraph_sdk import Auth
@@ -10,6 +11,7 @@ from langgraph_sdk import Auth
 auth = Auth()
 
 
+@cache
 def _tokens() -> dict[str, dict[str, Any]] | None:
     raw = os.environ.get("KISTE_API_TOKENS")
     if raw is None:
