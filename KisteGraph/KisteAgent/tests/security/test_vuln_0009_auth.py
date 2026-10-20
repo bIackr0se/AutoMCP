@@ -214,6 +214,71 @@ def test_owner_metadata_cannot_be_reassigned(api):
     assert api.get(f"/threads/{thread}", headers=headers("owner")).status_code == 200
 
 
+def test_create_existing_thread_is_owner_scoped(api):
+    thread = new_thread(api)
+    payload = {"thread_id": thread, "if_exists": "do_nothing"}
+    own = api.post("/threads", headers=headers("owner"), json=payload)
+    own.raise_for_status()
+    assert own.json()["thread_id"] == thread
+    assert own.json()["metadata"]["owner"] == "owner"
+
+    foreign = api.post("/threads", headers=headers("peer"), json=payload)
+    assert foreign.status_code == 409, foreign.text
+    assert api.get(f"/threads/{thread}", headers=headers("peer")).status_code == 404
+    assert api.get(f"/threads/{thread}", headers=headers("owner")).json() == own.json()
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"after_seconds": 60},
+        {"interrupt_before": ["review_gate_S"]},
+        {"checkpoint": {"checkpoint_ns": "other"}},
+        {"checkpoint_id": "00000000-0000-0000-0000-000000000001"},
+    ],
+    ids=["after_seconds", "interrupt_before", "checkpoint", "checkpoint_id"],
+)
+def test_reviewer_cannot_attach_run_controls_to_approval(api, extra):
+    thread = new_thread(api)
+    api.post(
+        f"/threads/{thread}/runs/wait",
+        headers=headers("owner"),
+        json={"assistant_id": "kiste_agent", "input": {"messages": []}},
+    ).raise_for_status()
+    api.post(
+        f"/threads/{thread}/state",
+        headers=headers("owner"),
+        json={
+            "values": {"messages": [{"type": "ai", "content": "verdict"}]},
+            "as_node": "query_analyzer_S",
+        },
+    ).raise_for_status()
+    api.post(
+        f"/threads/{thread}/runs/wait",
+        headers=headers("owner"),
+        json={"assistant_id": "kiste_agent", "input": None},
+    ).raise_for_status()
+    payload = {"assistant_id": "kiste_agent", "command": {"resume": "approved"}}
+    runs_before = api.get(f"/threads/{thread}/runs", headers=headers("owner")).json()
+    response = api.post(
+        f"/threads/{thread}/runs",
+        headers=headers("reviewer"),
+        json={**payload, **extra},
+    )
+    assert response.status_code in (403, 404), response.text
+    assert (
+        api.get(f"/threads/{thread}/runs", headers=headers("owner")).json()
+        == runs_before
+    )
+    approved = api.post(
+        f"/threads/{thread}/runs/wait",
+        headers=headers("reviewer"),
+        json=payload,
+    )
+    approved.raise_for_status()
+    assert "[Reviewed by operator]" in approved.text
+
+
 def test_reviewer_cannot_resume_foreign_menu_or_start_run(api):
     thread = new_thread(api)
     api.post(

@@ -79,10 +79,11 @@ async def read_assistants(ctx: Auth.types.AuthContext, value: Any) -> bool:
 @auth.on.threads.create
 async def create_thread(
     *, ctx: Auth.types.AuthContext, value: Auth.types.ThreadsCreate
-) -> bool:
+) -> Auth.types.FilterType | bool:
     """Overwrite caller-provided ownership on creation."""
     if not _local():
         value.setdefault("metadata", {})["owner"] = ctx.user.identity
+        return _owner(ctx)
     return True
 
 
@@ -141,14 +142,35 @@ async def create_run(
     value.setdefault("metadata", {})["owner"] = ctx.user.identity
     kwargs = value.get("kwargs") or {}
     command = kwargs.get("command") or {}
-    # A reviewer cannot attach input, state updates, routing or another command
-    # to an approval. Owners keep the platform's ordinary command semantics.
+    configurable = (kwargs.get("config") or {}).get("configurable") or {}
+    # Cross-owner approval carries only the resume, with no scheduling,
+    # cancellation or execution controls. Owners keep ordinary run semantics.
     if (
         "review" in ctx.permissions
         and value.get("thread_id")
+        and not value.get("after_seconds")
+        and value.get("multitask_strategy") in (None, "reject", "enqueue")
+        and value.get("if_not_exists") != "create"
         and isinstance(command, dict)
         and set(command) == {"resume"}
         and kwargs.get("input") is None
+        # create_valid_run merges request checkpoints into configurable before
+        # this hook; kwargs.checkpoint covers direct callback callers as well.
+        and not any(
+            configurable.get(key)
+            for key in ("thread_id", "checkpoint_ns", "checkpoint_id", "checkpoint_map")
+        )
+        and not any(
+            kwargs.get(key)
+            for key in (
+                "interrupt_before",
+                "interrupt_after",
+                "webhook",
+                "checkpoint",
+                "context",
+                "feedback_keys",
+            )
+        )
     ):
         checkpoint = await _review_checkpoint(value["thread_id"])
         if checkpoint:

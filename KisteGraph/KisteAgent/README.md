@@ -84,10 +84,12 @@ Environment variables (a `.env` file next to `agent.py` is loaded automatically)
 | `STANDBY_POLL_SECONDS` | Delay between alert checks | `5` |
 | `STANDBY_MAX_CONCURRENT` | Per-process standby limit, clamped below `N_JOBS_PER_WORKER` to retain an ordinary worker slot | half of `N_JOBS_PER_WORKER` (default `10`) |
 
-By default standby ends just before the server would stop the run itself, so it
-returns a timeout status. Time settings must be finite and positive.
+The default deadline is counted from when standby starts. The server's
+`BG_JOB_TIMEOUT_SECS` counts the whole run, including the assistant step before
+standby. Set `STANDBY_TIMEOUT_SECONDS` lower when the steps before standby can
+take longer than one poll interval. Time settings must be finite and positive.
 A process with only one worker has no standby capacity. Standby snapshots the
-latest execution timestamp and its document IDs once,
+latest execution timestamp and its document IDs in one search,
 then polls for an alert at or after that timestamp excluding those IDs. Each
 poll returns the exact document to pin, sorted by timestamp and alert UUID.
 If the baseline batch exceeds `STANDBY_BATCH_LIMIT`, polling requires a strictly

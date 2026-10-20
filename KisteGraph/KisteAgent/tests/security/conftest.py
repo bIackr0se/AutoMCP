@@ -34,6 +34,21 @@ def hit():
 
 
 @pytest.fixture
+def baseline_query(agent):
+    def matches(body):
+        if body.get("_source") != [agent._EXECUTION_TIMESTAMP]:
+            return False
+        assert body == {
+            "size": agent.STANDBY_BATCH_LIMIT + 1,
+            "sort": agent._ALERT_SORT,
+            "_source": [agent._EXECUTION_TIMESTAMP],
+        }
+        return True
+
+    return matches
+
+
+@pytest.fixture
 def elastic(agent, monkeypatch):
     def install(search, get=None):
         @asynccontextmanager

@@ -1111,24 +1111,22 @@ async def last_alert(state: AppState, alert_index: str = ES_ALERTS_INDEX, baseli
 
 async def standby_baseline(state: AppState):
     """Snapshot IDs at the latest execution, with exact truncation detection."""
-    latest = await last_alert(state)
-    if latest is None:
-        return {"timestamp": None, "ids": [], "truncated": False}
-    timestamp = _dig(latest, "kibana", "alert", "rule", "execution", "timestamp")
-    if timestamp is None:
-        raise ValueError("latest alert has no execution timestamp")
     async with get_elastic_client(state) as client:
         data = await client.search(index=ES_ALERTS_INDEX, body={
-            "query": {"term": {_EXECUTION_TIMESTAMP: timestamp}},
-            "size": STANDBY_BATCH_LIMIT, "sort": _ALERT_SORT,
-            "_source": False, "track_total_hits": True,
+            "size": STANDBY_BATCH_LIMIT + 1, "sort": _ALERT_SORT,
+            "_source": [_EXECUTION_TIMESTAMP],
         })
-    hits = data["hits"]["hits"]
-    total = data["hits"]["total"]
+    hits = data.get("hits", {}).get("hits", [])
+    if not hits:
+        return {"timestamp": None, "ids": [], "truncated": False}
+    timestamp = _dig(hits[0]["_source"], "kibana", "alert", "rule", "execution", "timestamp")
+    if timestamp is None:
+        raise ValueError("latest alert has no execution timestamp")
+    batch = [hit for hit in hits if _dig(hit["_source"], "kibana", "alert", "rule", "execution", "timestamp") == timestamp]
     return {
         "timestamp": timestamp,
-        "ids": sorted({hit["_id"] for hit in hits}),
-        "truncated": total["relation"] != "eq" or total["value"] > len(hits),
+        "ids": sorted({hit["_id"] for hit in batch[:STANDBY_BATCH_LIMIT]}),
+        "truncated": len(batch) > STANDBY_BATCH_LIMIT,
     }
 
 
@@ -1147,8 +1145,8 @@ if STANDBY_BATCH_LIMIT <= 0:
 
 # Bound each monitoring session and leave worker slots for ordinary requests.
 STANDBY_POLL_SECONDS = _positive_seconds("STANDBY_POLL_SECONDS", "5")
-# Default: end one poll before the LangGraph server's own background-run
-# timeout, so standby returns a timeout status instead of being killed.
+# Default: a standby deadline one poll shorter than the whole-run timeout.
+# Earlier steps use the same run budget; longer steps need a shorter deadline.
 _bg_job_timeout = _positive_seconds("BG_JOB_TIMEOUT_SECS", "86400")
 STANDBY_TIMEOUT_SECONDS = _positive_seconds(
     "STANDBY_TIMEOUT_SECONDS",
